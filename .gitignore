@@ -33,3 +33,4 @@ TECHNICAL_REPORT.md
 PROVE.md
 experimental_list.md
 data.md
+*.ipynb_checkpoints
