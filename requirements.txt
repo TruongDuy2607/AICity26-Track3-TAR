@@ -1,0 +1,16 @@
+# VLMs enviroments:
+conda create -n vlm python=3.12 -y
+pip install vllm==0.11.0   --extra-index-url https://download.pytorch.org/whl/cu128
+pip install ms-swift -U
+pip install transformers==4.57.0
+
+# Serving nvcc verion for cuda
+conda search -c nvidia cuda-nvcc | grep "12\.8"
+
+conda install -c nvidia cuda-nvcc=12.8.93 -y
+pip install flash-attn --no-build-isolation
+pip install qwen-vl-utils==0.0.14
+pip install deepspeed
+pip install decord
+pip install wandb
+pip install bert-score

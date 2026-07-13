@@ -1,0 +1,35 @@
+ms-swift
+.claude
+.cache
+# Secrets — NEVER commit. yt-dlp auth cookies grant full account access.
+cookies.txt
+*.cookies
+cookies*.txt
+# wandb API key (read by configs/qwen3vl_8b_lora.sh).
+configs/wandb.txt
+# Hugging Face token (read by configs/common.sh).
+configs/hf.txt
+
+# Pipeline outputs / data
+data/processed/
+output/
+preds/
+submissions/
+__pycache__/
+*.pyc
+
+test/videos
+backup
+data.ipynb_checkpoints/
+data
+CO_CHE_M0_M3.md
+m0-ver2.md
+report.md
+detail.md
+flow.md
+pipeline.md# Gemini API key (read by track3/gemini_render.py).
+configs/gemini-key.txt
+TECHNICAL_REPORT.md
+PROVE.md
+experimental_list.md
+data.md

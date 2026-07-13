@@ -1,0 +1,5 @@
+1. PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" CUDA_VISIBLE_DEVICES=0,1,2,3 GPU_MEM_UTIL=0.85 NUM_FRAMES=32 MODEL_PATH=output/prove_base_20260705_075519/v0-20260705-075536/ bash scripts/prove/phase3_infer.sh 
+
+2. PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" GPU_MEM_UTIL=0.85 CUDA_VISIBLE_DEVICES=0,1,2,3 DIRECT=1 TASKS="temporal_description" LENGTH_TOL=0.8 N_SAMPLES=16 SAMPLE_TEMPERATURE=0.8   PRED=preds/test_pred.struct0.jsonl SCENE_PROBES=preds/scene_probes.jsonl   OUT=preds/text_dossier.td700.jsonl CANDIDATES_OUT=preds/candidates.td700.jsonl  MODEL_PATH=output/prove_base_20260705_075519/v0-20260705-075536  bash scripts/text_dossier.sh
+
+3. python -m track3.mbr_select --candidates preds/candidates.td700.jsonl   --out preds/text_override.td700.jsonl
