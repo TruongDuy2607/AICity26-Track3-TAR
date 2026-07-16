@@ -1,17 +1,19 @@
 <div align="center">
 
-# AI City Challenge 2026 — Track 3: Traffic Anomaly Reasoning (TAR)
+# AI City Challenge 2026 — Track 3: Traffic Anomaly Reasoning
 
-**Team 12 — a unified Qwen3-VL-32B backbone + a verified, metric-aligned post-processing chain**
+## Team 12 — "Evidence-Driven Chained Reasoning for Unified Traffic Anomaly Understanding"
+
+[![Model Optimizer](https://img.shields.io/badge/HuggingFace-Qwen3_VL_32B-yellow.svg?logo=huggingface)](https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct)
+[![Model Optimizer](https://img.shields.io/badge/_-ms_swift-purple.svg?logo=modelscope)](https://github.com/modelscope/ms-swift)
+[![Model Optimizer](https://img.shields.io/badge/CUDA_Toolkit-NVIDIA-brightgreen.svg?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit-archive)
 
 </div>
-
-One LoRA-tuned **Qwen3-VL-32B-Instruct** backbone (no per-task models) followed by a
-deterministic, partial-safe post-processing chain. Two scripts reproduce everything:
-`phase0_base_sft.sh` (train) → `phase3_infer.sh` (infer → submission). The chain lifts
-the leaderboard mean (unweighted mean of the 9 graded tasks) from **0.5930** (base SFT) to **0.6669**.
+A system that separates what the model learns to produce from how its final answer is chosen. A single Vision-Language backbone is tuned once to give a fixed, task-appropriate answer for every question type. A deterministic and fully inspectable procedure then converts, verifies and selects among the backbone's own outputs, without prompting it in any form it was not trained on.
 
 ---
+
+![main](assets/main-overview.png)
 
 ## 1. Setup
 
@@ -78,6 +80,15 @@ reproduce.
 
 ## 2. Run
 
+### Step-0: Init
+Complete all information for Model path, Data root path, etc., in **[init.sh](init.sh)**
+```bash
+# 1. Dataset root (expected layout in README §1b).
+export TAR_ROOT="/abs/path/to/AI-City26-TAR/data"
+# 2. Base model: a local Qwen3-VL-32B-Instruct dir, or the HF id.
+export MODEL="Qwen/Qwen3-VL-32B-Instruct"
+```
+
 ### Step-1: Prepare Enviroments and Training data
 
 ```bash
@@ -98,6 +109,9 @@ swift export --adapters output/<run>/checkpoint-XXXX --merge_lora true
 ```
 
 ### Step-3: Inference
+
+> For reproduction, can be found our tuning Qwen3-VL-32B (merged) form Hugging Face here: [Checkpoint_Qwen3-VL-32B_Team12](https://huggingface.co/YudGNourt/Qwen3-VL-32B-TAR) 
+
 ```bash
 # (2) Infer — full inference chain -> FINAL submission (scripts/prove/phase3_infer.sh).
 #     MODEL_PATH is required: point it at the merged dir from step (1).
