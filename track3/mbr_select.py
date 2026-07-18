@@ -118,11 +118,60 @@ def run(records: list[dict], verify_by_item: dict[str, list[float]], lam: float,
     return out
 
 
+def run_oracle(records: list[dict], gt_by_item: dict[str, str],
+               pair_scorer) -> list[dict]:
+    """Pool CEILING (analysis-only, E5a): pick the candidate with the highest TRUE
+    BERTScore against the item's GT reference. This is NOT a submittable config (it
+    reads the answer) — it upper-bounds how good any selection over this pool could
+    be, isolating pool quality from selection quality. Items with no GT degrade to
+    candidates[0] (the greedy render)."""
+    flat_pairs: list[tuple[str, str]] = []
+    spans: list[tuple[dict, list[str], int]] = []
+    for rec in records:
+        cands = [c for c in rec.get("candidates", []) if (c or "").strip()]
+        gt = gt_by_item.get(str(rec["item_index"]), "")
+        spans.append((rec, cands, len(flat_pairs)))
+        if gt and len(cands) > 1:
+            flat_pairs += [(c, gt) for c in cands]
+    sims = pair_scorer(flat_pairs) if flat_pairs else []
+    out, picked = [], defaultdict(int)
+    for rec, cands, pos in spans:
+        if not cands:
+            continue
+        gt = gt_by_item.get(str(rec["item_index"]), "")
+        if gt and len(cands) > 1:
+            scores = sims[pos:pos + len(cands)]
+            choice = max(range(len(cands)), key=lambda i: (scores[i], -i))
+        else:
+            choice = 0
+        picked[choice] += 1
+        out.append({"item_index": rec["item_index"],
+                    "video_id": rec.get("video_id", ""),
+                    "task": rec.get("task", ""),
+                    "prediction": cands[choice], "source": "oracle"})
+    if out:
+        greedy = picked.get(0, 0)
+        print(f"[mbr-oracle] ceiling over {len(out)} item(s); greedy was best on "
+              f"{greedy} ({greedy / len(out):.0%}), histogram {dict(sorted(picked.items()))}")
+    return out
+
+
+def _gt_by_item(gt_path: str) -> dict[str, str]:
+    with open(gt_path, encoding="utf-8") as f:
+        data = json.load(f)
+    items = data.get("items", data) if isinstance(data, dict) else data
+    return {str(it.get("item_index")): str(it.get("answer", "")) for it in items}
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--candidates", required=True,
                    help="candidates jsonl from text_dossier --candidates-out.")
+    p.add_argument("--oracle-gt", default="",
+                   help="val_gt.json — enables ORACLE selection (pool ceiling, E5a): "
+                        "pick the candidate with the best true BERTScore vs the GT. "
+                        "Analysis-only, not a submittable config.")
     p.add_argument("--verify", default="",
                    help="verify jsonl from claim_verify --candidates (optional).")
     p.add_argument("--lam", type=float, default=0.0,
@@ -132,6 +181,16 @@ def main() -> None:
     a = p.parse_args()
 
     records = load_jsonl(a.candidates)
+    scorer = lambda pairs: _bertscore_pairs(pairs, a.batch_size)
+    if a.oracle_gt:
+        out = run_oracle(records, _gt_by_item(a.oracle_gt), scorer)
+        os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as f:
+            for rec in out:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        print(f"[mbr] wrote {len(out)} ORACLE-ceiling override(s) to {a.out}")
+        return
+
     verify_by_item = {}
     if a.verify and os.path.exists(a.verify):
         for rec in load_jsonl(a.verify):
@@ -139,8 +198,7 @@ def main() -> None:
     elif a.verify:
         print(f"[mbr][WARN] verify file {a.verify} not found — pure MBR (lam ignored).")
 
-    out = run(records, verify_by_item, a.lam,
-              lambda pairs: _bertscore_pairs(pairs, a.batch_size))
+    out = run(records, verify_by_item, a.lam, scorer)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w", encoding="utf-8") as f:
         for rec in out:

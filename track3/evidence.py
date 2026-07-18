@@ -58,8 +58,12 @@ def render_evidence_prompt(task: str, question: str, ev, with_video: bool = True
     the legacy v1 FactSheet/ClipFacts) — v1 sheets have no cast/scene/cause and render
     to exactly the v1 prompt."""
     lines = ["<video>"] if with_video else []
-    lines += [FACT_HEADERS.get(fact_policy, FACT_HEADERS["video-priority"]),
-              f"- Key event: {ev.event_phrase}."]
+    lines.append(FACT_HEADERS.get(fact_policy, FACT_HEADERS["video-priority"]))
+    # An empty event phrase (sheet-ablation "none"/"drop:event") drops the line
+    # entirely rather than rendering a bare "- Key event: ." — so a stripped sheet
+    # degrades to header + question, never a malformed fact line.
+    if ev.event_phrase:
+        lines.append(f"- Key event: {ev.event_phrase}.")
     if ev.window:
         lines.append(f"- It occurs between {ev.window[0]} and {ev.window[1]}.")
     cast = getattr(ev, "cast", ())

@@ -95,6 +95,11 @@ DOSS_ARGS=()
 [ -n "${SEED:-}" ] && DOSS_ARGS+=(--seed "$SEED")
 # GEN_BATCH bounds host RAM: requests per engine batch (decord decodes per request).
 [ -n "${GEN_BATCH:-}" ] && DOSS_ARGS+=(--gen-batch "$GEN_BATCH")
+# §5.2 sheet-ablation hook (scripts/ablations/) — the ONE variable an ablation
+# changes; everything else stays identical to the shipped render path.
+[ -n "${SHEET_TRANSFORM:-}" ] && DOSS_ARGS+=(--sheet-transform "$SHEET_TRANSFORM")
+[ -n "${TRANSFORM_SEED:-}" ] && DOSS_ARGS+=(--transform-seed "$TRANSFORM_SEED")
+[ -n "${SHEETS_OUT:-}" ] && DOSS_ARGS+=(--sheets-out "$SHEETS_OUT")
 PRED_ARG=(); [ -f "$PRED" ] && PRED_ARG=(--pred "$PRED")
 
 echo "[dossier] TEXT override -> $OUT  (TEST_JSON=$TEST_JSON, videos-root=$VIDEOS, pred=${PRED_ARG[*]:-none})"

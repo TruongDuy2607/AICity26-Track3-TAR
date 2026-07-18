@@ -419,6 +419,13 @@ class DossierConfig:
     sample_temperature: float = 0.8
     candidates_out: str = ""         # write {item_index, task, candidates} jsonl here
     seed: int = 0                    # jitter determinism
+    # Sheet-ablation hook (paper §5.2, track3.sheet_ablate) — a single transform
+    # applied to every clip's EvidenceSheet after clip_facts() and before rendering.
+    # "" == identity (the shipped pipeline). This is the ONLY thing an ablation
+    # changes; the render/length/candidate/MBR path stays identical to test.
+    sheet_transform: str = ""
+    transform_seed: int = 0
+    sheets_out: str = ""             # dump {video_id, facts, ablate} per clip here
 
 
 def _budget(task: str, cfg: DossierConfig) -> int:
@@ -475,6 +482,19 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
         print(f"[text_dossier][WARN] {missing} clip(s) have no video under "
               f"{videos_root} — skipped (those items keep the model's text). "
               "For a val split set GROUND_VIDEOS_ROOT=$TRAIN_VIDEOS_ROOT.")
+
+    # 1a) sheet-ablation hook (§5.2): mutate each clip's sheet, holding EVERYTHING
+    #     downstream identical to the shipped pipeline. Only meaningful in direct
+    #     mode (the 2-pass dossier is not a sheet ablation). Off by default.
+    if cfg.sheet_transform:
+        from track3 import sheet_ablate
+        ablate_log = sheet_ablate.apply(clips, cfg.sheet_transform, cfg.transform_seed)
+        print(f"[text_dossier] sheet-transform '{cfg.sheet_transform}' applied to "
+              f"{len(clips)} clip(s); {len(ablate_log)} clip(s) changed.")
+        if cfg.sheets_out:
+            _dump_sheets(clips, ablate_log, cfg.sheets_out)
+    elif cfg.sheets_out:
+        _dump_sheets(clips, [], cfg.sheets_out)
 
     if cfg.direct:
         # DIRECT: no analysis pass — render straight from the evidence sheet (parity
@@ -579,6 +599,20 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
     return _write(records, out_path)
 
 
+def _dump_sheets(clips: list[dict], ablate_log: list[dict], out_path: str) -> None:
+    """Persist the exact EvidenceSheet used per clip + its ablation record, so the
+    override/propagation analysis (E4) knows what was injected into which clip."""
+    import dataclasses as _dc
+    by_vid = {r["video_id"]: r for r in ablate_log}
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        for c in clips:
+            rec = {"video_id": c["vid"], "facts": _dc.asdict(c["facts"]),
+                   "ablate": by_vid.get(c["vid"])}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    print(f"[text_dossier] dumped {len(clips)} sheet(s) to {out_path}")
+
+
 def _write(records: list[dict], out_path: str) -> list[dict]:
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -664,6 +698,16 @@ def main() -> None:
     p.add_argument("--candidates-out", default="",
                    help="write the {item_index, task, candidates} pool jsonl here.")
     p.add_argument("--seed", type=int, default=0, help="fact-jitter determinism.")
+    # §5.2 sheet-ablation hook (track3.sheet_ablate) — the one variable an ablation
+    # changes. "" = the shipped pipeline. See scripts/ablations/.
+    p.add_argument("--sheet-transform", default="",
+                   help="evidence-sheet ablation: none | drop:FIELD | keep:FIELD | "
+                        "swap | corrupt:FIELD[:P]  (FIELD in event,window,cast,scene,"
+                        "cause,consequence,observations). '' = no ablation (ours).")
+    p.add_argument("--transform-seed", type=int, default=0,
+                   help="determinism for swap/corrupt donor selection.")
+    p.add_argument("--sheets-out", default="",
+                   help="dump the exact per-clip sheet + ablation record here (E4).")
     p.add_argument("--no-render-video", action="store_true",
                    help="render text-only from the dossier (cheaper; further from "
                         "the SFT input distribution — gate on curated-val).")
@@ -680,7 +724,9 @@ def main() -> None:
         render_max_tokens=a.render_max_tokens, temperature=a.temperature,
         direct=a.direct, fact_policy=a.fact_policy,
         n_samples=a.n_samples, sample_temperature=a.sample_temperature,
-        candidates_out=a.candidates_out, seed=a.seed)
+        candidates_out=a.candidates_out, seed=a.seed,
+        sheet_transform=a.sheet_transform, transform_seed=a.transform_seed,
+        sheets_out=a.sheets_out)
 
     items_by_video = load_items_by_video(a.test_json)
     if a.limit:

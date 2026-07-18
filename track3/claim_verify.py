@@ -85,10 +85,15 @@ def aggregate_verify(claim_probs: list[float]) -> float:
     return sum(claim_probs) / len(claim_probs) if claim_probs else 0.5
 
 
-def verify_candidates(records: list[dict], prob_fn) -> list[dict]:
+def verify_candidates(records: list[dict], prob_fn,
+                      claims_sink: list | None = None) -> list[dict]:
     """Per candidates-record verify scores. ``prob_fn(jobs) -> [P(Yes)]`` with jobs
     ``[{video_id, question}]`` is injected (the real scorer below; a stub in tests).
-    Probes are deduplicated per (video_id, claim) across candidates/items."""
+    Probes are deduplicated per (video_id, claim) across candidates/items.
+
+    When ``claims_sink`` is given it is extended with one
+    ``{video_id, claim, p_yes}`` per unique probed claim — the raw per-claim
+    self-verification distribution the paper's §5.2 gap analysis reads (E1)."""
     probe_key_to_pos: dict[tuple[str, str], int] = {}
     jobs: list[dict] = []
     plans = []       # (rec, [[probe positions] per candidate])
@@ -101,13 +106,17 @@ def verify_candidates(records: list[dict], prob_fn) -> list[dict]:
                 key = (vid, claim.lower())
                 if key not in probe_key_to_pos:
                     probe_key_to_pos[key] = len(jobs)
-                    jobs.append({"video_id": vid,
+                    jobs.append({"video_id": vid, "claim": claim,
                                  "question": claim_probe_question(claim)})
                 positions.append(probe_key_to_pos[key])
             cand_positions.append(positions)
         plans.append((rec, cand_positions))
 
     probs = prob_fn(jobs) if jobs else []
+    if claims_sink is not None:
+        for j, p in zip(jobs, probs):
+            claims_sink.append({"video_id": j["video_id"], "claim": j["claim"],
+                                "p_yes": float(p)})
     out = []
     for rec, cand_positions in plans:
         scores = [aggregate_verify([probs[p] for p in positions])
@@ -213,6 +222,9 @@ def main() -> None:
                    help="candidates jsonl (text_dossier --candidates-out).")
     p.add_argument("--out", default="preds/verify.jsonl",
                    help="verify-scores jsonl (claims mode).")
+    p.add_argument("--claim-probs-out", default="",
+                   help="also dump the raw per-claim {video_id, claim, p_yes} "
+                        "distribution here (paper §5.2 self-verification gap, E1).")
     # scene mode
     p.add_argument("--test-json", default="",
                    help="items json — the clips to scene-probe.")
@@ -247,12 +259,22 @@ def main() -> None:
 
     if a.candidates:
         records = _load_jsonl(a.candidates)
-        out = verify_candidates(records, scorer)
+        claims_sink: list = [] if a.claim_probs_out else None
+        out = verify_candidates(records, scorer, claims_sink=claims_sink)
         os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as f:
             for rec in out:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         print(f"[verify] wrote {len(out)} verify record(s) to {a.out}")
+        if a.claim_probs_out and claims_sink is not None:
+            os.makedirs(os.path.dirname(a.claim_probs_out) or ".", exist_ok=True)
+            with open(a.claim_probs_out, "w", encoding="utf-8") as f:
+                for rec in claims_sink:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            rej = sum(1 for r in claims_sink if r["p_yes"] < 0.5)
+            print(f"[verify] dumped {len(claims_sink)} claim prob(s) to "
+                  f"{a.claim_probs_out}; {rej} ({rej / max(1, len(claims_sink)):.0%}) "
+                  f"self-rejected (P(Yes)<0.5).")
 
     if a.scene_out:
         vids = sorted({it["video_id"] for it in test_items})
