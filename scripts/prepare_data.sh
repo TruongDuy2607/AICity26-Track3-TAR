@@ -6,12 +6,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$HERE/configs/common.sh"
 
 cd "$HERE"
-# SKIP_BASE=1: reuse an existing data/processed/{train,val}.jsonl and only run the
-# optional render-SFT block below (keeps the base split IDENTICAL across phases —
-# a rebuild would reshuffle nothing but wastes minutes on 44k items). Falls back to
-# a full build when the base set is absent.
+# SKIP_BASE=1: reuse the existing base train/val jsonl (only the render-SFT block runs).
 if [ "${SKIP_BASE:-0}" = "1" ] && [ -f "$DATA_DIR/train.jsonl" ]; then
-    echo "[prepare] SKIP_BASE=1 — reusing base SFT set at $DATA_DIR/train.jsonl"
+    echo "[prepare] SKIP_BASE=1: reusing base SFT set at $DATA_DIR/train.jsonl"
 else
     # FILTER_TEMPORAL=1 drops degenerate auto-labelled temporal intervals;
     # TEMPORAL_COT=1 trains an inline timestamp chain-of-thought before the JSON.
@@ -34,15 +31,12 @@ else
         --skip-missing \
         "$@"
 
-    # Validate the processed jsonl before it is ever fed to the trainer.
     echo "[prepare] validating processed dataset ..."
     python -m track3.check_dataset --data-dir "$DATA_DIR"
 fi
 
-# --- OPTIONAL: Fact-Sheet->Answer SFT distillation set (strategy C: GT facts + noise) --
-# RENDER_SFT=1 also builds data/processed/render_sft.jsonl and mixes it with the base
-# train.jsonl (render:base = 1:REPLAY_RATIO) into data/processed/train_render.jsonl,
-# which train-runai.sh picks up automatically when RENDER_SFT=1. Default off -> unchanged.
+# Optional (RENDER_SFT=1): build render_sft.jsonl and mix it with train.jsonl into
+# train_render.jsonl (used by train-runai.sh when RENDER_SFT=1).
 if [ "${RENDER_SFT:-0}" = "1" ]; then
     echo "[prepare] building Fact-Sheet->Answer render-SFT set (strategy C) ..."
     # shellcheck disable=SC2086  # RENDER_TASKS is an intentional word-split list

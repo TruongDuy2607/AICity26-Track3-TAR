@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
-"""Regression test: our extractors/submission must agree with track3/evaluate.py.
+"""Check that track3.tasks extractors agree with the official track3/evaluate.py.
 
-Guards against drift between track3.tasks (used to build submissions + vote) and
-the organizers' official scorer. Run after changing either side:
-
-    python -m track3.check_eval
+Run: python -m track3.check_eval
 """
 import os
 import sys
@@ -12,8 +9,6 @@ import sys
 from track3.official import load_official
 from track3 import tasks as T
 
-# repo root = parent of the track3/ package; the TAR dataset ships test.json +
-# submission.example.csv under data/test/.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TEST_JSON = os.path.join(_REPO_ROOT, "data", "test", "test.json")
 _EXAMPLE_SUB = os.path.join(_REPO_ROOT, "data", "test", "submission.example.csv")

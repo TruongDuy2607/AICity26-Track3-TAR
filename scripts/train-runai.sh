@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Fine-tune a Qwen3-VL model (LoRA SFT) on the TAR multi-task dataset (Run:AI).
-# Logs into HF, auto-prepares data, then trains. Activate the conda env yourself
-# (see requirements.txt) BEFORE running this script.
-# The model recipe is chosen with MODEL_CONFIG (configs/<MODEL_CONFIG>.sh).
+# LoRA SFT of Qwen3-VL on the TAR multi-task dataset (Run:AI): HF login, data prep, train.
+# Activate the conda env yourself first. Recipe: MODEL_CONFIG (configs/<MODEL_CONFIG>.sh).
 #
 # Usage:
 #   bash scripts/train-runai.sh                                  # default 32B config + 4xA100-80G
@@ -11,17 +9,15 @@
 set -euo pipefail
 # common.sh resolves + exports HERE (repo root) from its own location.
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/configs/common.sh"
-# Model recipe (defaults to the Qwen3-VL-8B-Instruct baseline).
 MODEL_CONFIG="${MODEL_CONFIG:-qwen3vl_32b_lora}"
 source "$HERE/configs/${MODEL_CONFIG}.sh"
 PROFILE="${PROFILE:-a100_80g_4x_32b}"
 source "$HERE/configs/profiles/${PROFILE}.sh"
-# HF_TOKEN comes from configs/hf.txt via common.sh (gitignored, like wandb.txt).
+# HF_TOKEN comes from configs/hf.txt via common.sh.
 HF_TOKEN="${HF_TOKEN:-}"
 echo "[train] python: $(which python)"
 
 if [ -n "$HF_TOKEN" ]; then
-    # log "Logging into Hugging Face"
     hf auth login --token "$HF_TOKEN" --add-to-git-credential
     hf auth whoami || true
 else
@@ -29,29 +25,25 @@ else
 fi
 
 
-# Build the ms-swift jsonl (data/processed/{train,val}.jsonl + val_gt.json) if it
-# isn't there yet — fresh Run AI nodes start without it. Idempotent: skipped when
-# train.jsonl already exists. Force a rebuild with FORCE_PREPARE=1.
+# Prepare data if missing (fresh nodes) or when FORCE_PREPARE=1.
 if [ "${FORCE_PREPARE:-0}" = "1" ] || [ ! -f "$DATA_DIR/train.jsonl" ]; then
-    echo "[train] processed data not found at $DATA_DIR — running prepare_data.sh ..."
+    echo "[train] processed data not found at $DATA_DIR; running prepare_data.sh ..."
     bash "$HERE/scripts/prepare_data.sh"
 else
     echo "[train] using existing processed data at $DATA_DIR"
 fi
 
-# RENDER_SFT=1: train on the Fact-Sheet->Answer distillation mixed set (build if absent;
-# prepare_data.sh with RENDER_SFT=1 emits data/processed/train_render.jsonl).
+# RENDER_SFT=1: train on the render-SFT mixed set (built if absent).
 if [ "${RENDER_SFT:-0}" = "1" ] && [ ! -f "$DATA_DIR/train_render.jsonl" ]; then
     echo "[train] RENDER_SFT=1: building the render-SFT mixed set ..."
     RENDER_SFT=1 bash "$HERE/scripts/prepare_data.sh"
 fi
 
-# Training set: defaults to the prepared SFT jsonl (train_render.jsonl when RENDER_SFT=1).
 _DEFAULT_JSONL="$DATA_DIR/train.jsonl"
 [ "${RENDER_SFT:-0}" = "1" ] && _DEFAULT_JSONL="$DATA_DIR/train_render.jsonl"
 TRAIN_JSONL="${TRAIN_JSONL:-$_DEFAULT_JSONL}"
 RUN_DIR="${RUN_DIR:-$OUTPUT_DIR/${MODEL_CONFIG}_${PROFILE}_$(date +%Y%m%d_%H%M%S)}"
-# Name the wandb run after the output dir (HF wandb integration reads WANDB_NAME).
+# wandb run name = output dir name
 export WANDB_NAME="${WANDB_NAME:-$(basename "$RUN_DIR")}"
 echo "[train] profile=$PROFILE gpus=$CUDA_VISIBLE_DEVICES out=$RUN_DIR"
 echo "[train] report_to='$REPORT_TO'$([[ \"$REPORT_TO\" == *wandb* ]] && echo \" project=$WANDB_PROJECT mode=$WANDB_MODE run=$WANDB_NAME\")"
@@ -61,7 +53,7 @@ cd "$HERE"
 # pass --model_type only when explicitly set (else ms-swift auto-infers it)
 MODEL_TYPE_ARG=()
 [ -n "${MODEL_TYPE:-}" ] && MODEL_TYPE_ARG=(--model_type "$MODEL_TYPE")
-# pass --deepspeed only when set (DeepSpeed requires nvcc; not needed for LoRA)
+# pass --deepspeed only when set
 DEEPSPEED_ARG=()
 [ -n "${DEEPSPEED:-}" ] && DEEPSPEED_ARG=(--deepspeed "$DEEPSPEED")
 

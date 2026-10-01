@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-# Model + LoRA + optimization hyper-parameters (Phase-1 Qwen3-VL-8B-Instruct SFT).
-# Sourced by scripts/train-runai.sh after configs/common.sh and a hardware profile.
+# Model + LoRA + optimization hyper-parameters (Qwen3-VL-32B-Instruct SFT).
+# Sourced by the scripts after configs/common.sh.
 
 # base model
 export MODEL="${MODEL:-/home/jovyan/minh-workspace/duy/AI-City26-Track3/models/Qwen3-VL-32B-Instruct}"
 export TORCH_DTYPE="${TORCH_DTYPE:-bfloat16}"
-# If auto-inference ever fails for a local path, set MODEL_TYPE=qwen3_vl (passed
-# through only when non-empty; see scripts/train-runai.sh).
+# Set MODEL_TYPE=qwen3_vl if auto-detection fails for a local path.
 export MODEL_TYPE="${MODEL_TYPE:-}"
 
 # LoRA
@@ -24,11 +23,8 @@ export WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 export MAX_LENGTH="${MAX_LENGTH:-4096}"
 export LR_SCHEDULER="${LR_SCHEDULER:-cosine}"
 
-# experiment tracking (wandb)
-# wandb is ON by default. The API key is auto-loaded from configs/wandb.txt
-# (gitignored) so no manual `wandb login` is needed; override WANDB_KEY_FILE to
-# point elsewhere, or export WANDB_API_KEY directly to take precedence. Set
-# REPORT_TO=tensorboard to opt out. WANDB_NAME is set per-run in scripts/train-runai.sh.
+# experiment tracking: wandb by default, key auto-loaded from configs/wandb.txt
+# (gitignored). Set REPORT_TO=tensorboard to opt out.
 export REPORT_TO="${REPORT_TO:-wandb}"                # tensorboard | wandb | "wandb tensorboard"
 export WANDB_PROJECT="${WANDB_PROJECT:-aicity26-track3}"
 export WANDB_MODE="${WANDB_MODE:-online}"             # online | offline | disabled
@@ -40,7 +36,7 @@ fi
 
 
 if [[ "$REPORT_TO" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
-    echo "[wandb][WARN] no WANDB_API_KEY and no $_WANDB_KEY_FILE — disabling wandb." >&2
+    echo "[wandb][WARN] no WANDB_API_KEY and no $_WANDB_KEY_FILE, disabling wandb." >&2
     REPORT_TO="$(echo "${REPORT_TO//wandb/}" | xargs)"
     [ -z "$REPORT_TO" ] && REPORT_TO="none"
     export REPORT_TO WANDB_MODE="disabled"

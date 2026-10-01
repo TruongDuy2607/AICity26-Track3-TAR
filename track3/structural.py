@@ -1,24 +1,11 @@
-"""Structural Post-Processor — convert measured dataset couplings into points.
+"""Structural post-processor: rule-based fixes on (test.json, predictions jsonl).
 
-method.md §4. Operates on (test.json, predictions jsonl) -> revised predictions
-jsonl. Every rule is independently flag-gated so each leaderboard submission can
-enable exactly one new lever (method.md §5.3), and every rule degrades gracefully
-to the raw model prediction when its precondition is missing.
+Each rule is flag-gated and keeps the model prediction when its precondition is missing.
 
-Rules (the simplified set kept after the 2026-06 ablation; the dropped 4.3
-cross_task and 4.4 timestamp_echo live in backup/track3/structural_legacy_rules.py):
-
-  --temporal-prior   4.1  temporal_localization := the [X,Y] window parsed from the
-                          same video's temporal_description question (measured
-                          mIoU 0.662 on train GT; data.md §5.1), fallback to the
-                          causal_linkage window, else keep the model output.
-  --bcq-pairing      4.2  per video the two bcq items are {one Yes, one No}
-                          (3,666/3,669 on train; data.md §5.2): when the model
-                          answers both the same, flip the lower-confidence one.
-
-Confidence: items may carry a ``votes`` field ({token: weight}) persisted by
-infer.py's first-token logprob (or self-consistency) pass; without it the margin
-is 0 and bcq_pairing flips an arbitrary member of an agreeing pair.
+  --temporal-prior   temporal_localization := the [X,Y] window of the same video's
+                     temporal_description question (fallback: causal_linkage window).
+  --bcq-pairing      a video's two bcq items are {Yes, No}: when both agree, flip the
+                     lower-confidence one (by the ``votes`` margin).
 
 Run::
 
@@ -35,23 +22,14 @@ from collections import defaultdict
 
 from track3.tasks import extract_yesno, parse_timestamp
 
-# MM:SS / MM:SS.ff / HH:MM:SS — the timestamp surface forms used in TAR questions.
+# MM:SS / MM:SS.ff / HH:MM:SS timestamps in TAR questions.
 _TS = re.compile(r"\d{1,2}:\d{2}(?:\.\d+)?(?::\d{2}(?:\.\d+)?)?")
-# The MM:SS:ff typo: 18/80 test td-windows write the fractional separator as a
-# colon ("00:08:78"), which parse_timestamp reads as HH:MM:SS = 558 s and zeros the
-# leak's IoU on those items (the same video's cl question uses the correct dot).
+# MM:SS:ff typo: a colon used as the fractional separator, e.g. "00:08:78".
 _COLON3 = re.compile(r"^(\d{1,2}):(\d{2}):(\d{2}(?:\.\d+)?)$")
 
 
-# ---------------------------------------------------------------------------
-# Shared parsing helpers
-# ---------------------------------------------------------------------------
-
 def normalize_ts(ts: str) -> str:
-    """Repair the MM:SS:ff colon typo to MM:SS.ff. Test clips are < ~60 s, so any
-    ``d:dd:dd`` parsing to > 60 s is unambiguously the typo; a no-op on well-formed
-    MM:SS / MM:SS.ff (and on train HH:MM:SS, which is never produced for these clips).
-    Single shared copy: temporal_grounding / text_dossier / mcqoe_anchor import it."""
+    """Repair the MM:SS:ff typo to MM:SS.ff (clips are < ~60 s, so d:dd:dd > 60 s is the typo)."""
     ts = str(ts).strip()
     m = _COLON3.match(ts)
     if m and parse_timestamp(ts) > 60.0:
@@ -60,16 +38,12 @@ def normalize_ts(ts: str) -> str:
 
 
 def resolve_video(videos_root: str, vid: str) -> str:
-    """Absolute path for a video_id under videos_root (absolute ids pass through).
-    Single shared copy: temporal_grounding / text_dossier / mcqoe_anchor import it."""
+    """Absolute path for a video_id under videos_root (absolute ids pass through)."""
     return vid if os.path.isabs(vid) else os.path.join(videos_root, vid)
 
 
 def question_window(question: str) -> tuple[str, str] | None:
-    """The [X,Y] interval carried by a td/cl question, as the timestamp strings
-    (fractional seconds preserved — 20% of GT intervals are <3 s and the grader's
-    IoU is exact), with the MM:SS:ff typo repaired. Ordered by parsed seconds.
-    None when <2 timestamps."""
+    """The [X,Y] timestamps of a td/cl question (typo-repaired, ordered), or None."""
     ts = _TS.findall(question or "")
     if len(ts) < 2:
         return None
@@ -78,8 +52,7 @@ def question_window(question: str) -> tuple[str, str] | None:
 
 
 def question_stem(question: str) -> str:
-    """The question proper, without the per-task answer-format instruction —
-    the join key for bcq <-> bcq_openended (verbatim-identical stems on test)."""
+    """First question line, lowercased (bcq <-> bcq_openended join key)."""
     return (question or "").strip().splitlines()[0].strip().lower()
 
 
@@ -87,9 +60,7 @@ _OPTION = re.compile(r"^\s*([A-D])[).]\s*(.+?)\s*$", re.MULTILINE)
 
 
 def question_options(question: str, normalize: bool = True) -> dict[str, str]:
-    """{letter: option text} for an mcq-style question. ``normalize=True`` gives
-    the lowercased/de-punctuated form used to match options by text (mcqoe anchor /
-    infer twin-pairing); ``normalize=False`` keeps the verbatim text."""
+    """{letter: option text}; ``normalize`` lowercases and strips punctuation."""
     out = {}
     for m in _OPTION.finditer(question or ""):
         text = m.group(2).strip()
@@ -98,11 +69,7 @@ def question_options(question: str, normalize: bool = True) -> dict[str, str]:
 
 
 def _vote_margin(rec: dict) -> float:
-    """Winner-minus-runner-up from a persisted ``votes`` field, else 0.
-
-    ``votes`` maps token -> weight; weights may be sample counts (self-consistency
-    voting) or probabilities (first-token logprob scoring) — the margin works the
-    same either way, it only orders the two items of a pair."""
+    """Winner-minus-runner-up weight of the ``votes`` field ({token: weight}), else 0."""
     votes = rec.get("votes") or {}
     counts = sorted(votes.values(), reverse=True)
     if len(counts) >= 2:
@@ -110,19 +77,11 @@ def _vote_margin(rec: dict) -> float:
     return float(counts[0]) if counts else 0.0
 
 
-# ---------------------------------------------------------------------------
-# Rule 4.1 — temporal prior override
-# ---------------------------------------------------------------------------
-
 def apply_temporal_prior(items_by_video: dict, preds: dict,
                          override: dict | None = None) -> int:
     """Replace temporal_localization predictions with the td/cl question window.
 
-    ``override`` (item_index -> {"start","end"}) lets an external temporal method
-    supply a per-item window in place of the default td-copy (a generic injection
-    point; the retired window-chooser used it, future temporal rules can too).
-    Items absent from ``override`` fall back to the td-window prior, so a partial
-    override is safe.
+    ``override`` (item_index -> {"start","end"}) takes precedence per item.
     """
     override = override or {}
     changed = 0
@@ -145,17 +104,13 @@ def apply_temporal_prior(items_by_video: dict, preds: dict,
             elif window is not None:
                 start, end = window
             else:
-                continue  # no prior and no override -> keep the model's prediction
+                continue  # keep the model's prediction
             interval = json.dumps({"start": start, "end": end})
             rec["prediction"] = f"```json\n{interval}\n```"
             rec["structural"] = "temporal_override" if chosen is not None else "temporal_prior"
             changed += 1
     return changed
 
-
-# ---------------------------------------------------------------------------
-# Rule 4.2 — bcq {Yes,No} pairing
-# ---------------------------------------------------------------------------
 
 def _retoken_open(rec: dict, token: str) -> int:
     """Force an open-ended answer to open with ``token`` (keep the explanation)."""
@@ -194,19 +149,8 @@ def apply_bcq_pairing(items_by_video: dict, preds: dict) -> int:
     return changed
 
 
-# ---------------------------------------------------------------------------
-# Text override — external-text injection point (Collision Dossier / mcqoe anchor)
-# ---------------------------------------------------------------------------
-
 def apply_text_override(preds: dict, override: dict) -> int:
-    """Replace open-ended text predictions with externally generated answers.
-
-    ``override`` maps item_index -> prediction text (e.g. the collision-dossier
-    renders from :mod:`track3.text_dossier` for the four BERTScore paragraph
-    tasks). A generic injection point mirroring the temporal ``--temporal-override``
-    hook: items absent from ``override`` keep the model's own prediction, so a
-    partial override (only some tasks / items) is safe and degrades gracefully.
-    """
+    """Replace predictions with external text (item_index -> text); absent items are kept."""
     changed = 0
     for idx, text in override.items():
         rec = preds.get(str(idx))
@@ -217,10 +161,6 @@ def apply_text_override(preds: dict, override: dict) -> int:
         changed += 1
     return changed
 
-
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
 
 def load_items_by_video(test_json: str) -> dict:
     with open(test_json, "r", encoding="utf-8") as f:
@@ -265,8 +205,7 @@ def run(test_json: str, pred_path: str, out_path: str, rules: dict[str, bool],
                 order.append(str(rec["item_index"]))
 
     report = {}
-    # Text override runs first so the rules below operate on the final,
-    # dossier-rendered answer (e.g. bcq_pairing on a dossier-rewritten bcq_oe twin).
+    # text override first, so the rules below see the final text
     if text_override:
         report["text_override"] = apply_text_override(
             preds, _load_text_override(text_override))

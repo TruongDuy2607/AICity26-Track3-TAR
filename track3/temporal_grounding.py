@@ -1,66 +1,17 @@
-"""Level-1 — Referring-Expression Dense Grounding for temporal_localization.
+"""Referring-expression frame grounding for temporal_localization.
 
-ISOLATED, REMOVABLE add-on (like the retired RFT / window-chooser): a single
-module + ``scripts/temporal_grounding.sh``. It touches NO existing file — it only
-*produces* a ``{item_index,start,end}`` jsonl that the already-present
-``track3.structural`` rule 4.1 ``--temporal-override`` hook consumes. Removal =
-``git rm track3/temporal_grounding.py scripts/temporal_grounding.sh``.
+Writes a ``{item_index, start, end}`` jsonl for ``structural --temporal-override``.
+Per temporal_localization item:
 
-----------------------------------------------------------------------------
-WHY (theory — see data.md §5.1 / method.md §9.7.3 and the analysis it followed)
-----------------------------------------------------------------------------
-The td-window "temporal leak" (copy the [X,Y] from the temporal_description
-question) is a strong PRIOR but caps at ~0.61 mIoU on the human-curated test GT.
-Measured facts that pin down *why* and shape this method:
-
-  * On train AUTO GT the td-window equals the tl GT for 59% of videos and is
-    near-zero for 24% — it is bimodal (the auto-labeler reused the same window).
-  * On the TEST questions the td-window is already TIGHT: median 2.0 s, mean
-    2.47 s, 70% < 3 s. So the 0.61 cap is NOT a width problem — it is a LOCATION
-    problem: for ~40% of items the td window points to the wrong moment vs the
-    curator's tight window. No deterministic transform of the leak fixes that.
-  * The tl question NAMES the exact event ("the T-bone collision and subsequent
-    rollover of the white van"). That is a referring expression we can ground.
-
-So: keep the td prior where it is right (≈60%, free), and for the rest RELOCATE
-to where the named event actually happens in the pixels. We reframe localization
-as per-frame DISCRIMINATION (the W1 lesson: discrimination ≫ free generation;
-the model's free localization is only ~0.20, but a binary "is the event in THIS
-frame?" is easy). Crucially we score ONE STILL IMAGE per query and read its
-first-token Yes/No logprob — the model never emits a timestamp, so the image-list
-fps/position-ID corruption that capped free localization at 0.186 (see
-tasks.frame_plan / configs/common.sh) simply does not apply here; the timestamp
-comes from OUR frame sampling, not the model.
-
-----------------------------------------------------------------------------
-ALGORITHM (per temporal_localization item)
-----------------------------------------------------------------------------
-1. Parse the event phrase E from the tl question ("When does <E> occur?").
-2. Prior window P=[X,Y] from the same video's temporal_description (fallback
-   causal_linkage) question — the proven leak; also the relocation width. The two
-   timestamps are run through normalize_ts first: 18/80 test td-windows write the
-   fractional separator as a colon ("00:08:78"), which the grader misreads as
-   558 s and zeros the leak on those items — repairing it is a free win even on
-   the kept-prior path, independent of the model.
-3. Sample dense frames (≈ every ``stride`` s, clamped to [min,max] frames) with
-   their wall-clock timestamps t_i.
-4. For each frame score s_i = P(first token == "Yes") to "Is <E> happening in
-   THIS frame?" via one max_tokens=1 logprob pass (reuses infer._first_token_dist).
-5. Smooth s_i; take the peak t* and the contiguous span above rel_thresh·peak.
-6. FUSE with the prior (never empty, degrades to the 0.61 leak):
-     - low peak confidence                          -> keep P  (trust the leak)
-     - peak inside P, or det-span overlaps P enough -> keep P  (leak confirmed)
-     - peak confidently OUTSIDE P *and* the model is unconvinced inside P
-       (peak_score - prior_score ≥ margin)          -> RELOCATE
-   Relocation default = a window of the PRIOR's (measured-correct ~2 s) width
-   centered on t*; ``relocate_width=span`` uses the raw detected span instead.
-
-Output jsonl line: {item_index, video_id, start, end, source, peak_t,
-peak_score, ...} where start/end are "MM:SS.ff" (or the verbatim prior strings
-when the prior is kept, preserving fractional seconds exactly as the leak does).
-
-Heavy deps (cv2, ms-swift, torch) are imported lazily so the pure decision logic
-(parse/smooth/peak/span/fuse/iou) is unit-testable on a CPU dev box with stubs.
+1. Parse the event phrase E from the question ("When does <E> occur?").
+2. Prior window P = the same video's td (else cl) question window, typo-repaired.
+3. Sample dense frames (about every ``stride`` s) with their timestamps.
+4. Score each frame: P(first token == "Yes") to "Is <E> happening in this frame?".
+5. Smooth; take the peak and the contiguous span above rel_thresh * peak.
+6. Fuse with the prior:
+     - peak inside P, or span overlaps P        -> keep P
+     - peak outside P but not confident enough  -> keep P
+     - otherwise                                -> relocate (prior width at the peak, or the span)
 """
 from __future__ import annotations
 
@@ -79,10 +30,6 @@ from track3.structural import (
 )
 from track3.tasks import extract_interval_obj, parse_timestamp
 
-# ---------------------------------------------------------------------------
-# Pure helpers — no cv2 / swift / torch (unit-testable on the dev box)
-# ---------------------------------------------------------------------------
-
 _WHEN = re.compile(r"when\s+does\s+(.+?)\s+occur\b", re.I)
 _WHEN_ALT = re.compile(r"when\s+(?:is|are|do|did|was|were)\s+(.+?)[?.]", re.I)
 
@@ -90,12 +37,7 @@ _WHEN_ALT = re.compile(r"when\s+(?:is|are|do|did|was|were)\s+(.+?)[?.]", re.I)
 def parse_event_phrase(question: str) -> str:
     """The referring expression E from a temporal_localization question.
 
-    "When does the T-bone collision and subsequent rollover of the white van
-    occur?\\n\\nProvide ... json ..." -> "the T-bone collision and subsequent
-    rollover of the white van". The trailing format instruction lives on its own
-    line; a trailing location clause ("... occur in the intersection?") is dropped
-    (it does not help temporal localization). Degrades to the question's first
-    line, then to a generic anomaly phrase, so it never returns empty.
+    Falls back to the first question line, then a generic phrase; never empty.
     """
     first = (question or "").strip().splitlines()[0].strip() if question else ""
     m = _WHEN.search(first) or _WHEN_ALT.search(first)
@@ -105,8 +47,7 @@ def parse_event_phrase(question: str) -> str:
 
 
 def fmt_ts(sec: float) -> str:
-    """Seconds -> "MM:SS.ff" (fractional preserved — 20% of GT intervals < 3 s,
-    and the official IoU is exact). The grader's _parse_timestamp reads it back."""
+    """Seconds -> "MM:SS.ff" (fractional seconds preserved)."""
     sec = max(0.0, float(sec))
     m = int(sec // 60)
     s = sec - 60 * m
@@ -145,7 +86,7 @@ class GroundConfig:
     smooth_k: int = 3
     rel_thresh: float = 0.5      # span = contiguous frames with score >= rel*peak
     min_width: float = 1.0       # floor on a detected span (s)
-    # fusion (the prior-protection gate)
+    # fusion with the prior
     conf_thresh: float = 0.5     # min peak P(Yes) to even consider relocating
     margin: float = 0.15         # peak must beat the best in-prior score by this
     agree_iou: float = 0.10      # det-span overlapping P this much -> P confirmed
@@ -165,24 +106,21 @@ def ground_video(prior: tuple[float, float] | None,
                  scores: list[float],
                  duration: float,
                  cfg: GroundConfig) -> dict:
-    """Decide the final [start,end] (seconds) from per-frame scores + the prior.
+    """Final [start, end] (seconds) from per-frame scores + the prior. Pure, no IO.
 
-    Returns a dict: start, end (floats, seconds), source (str), peak_t,
-    peak_score, prior_score, det_start, det_end. Pure — no IO. ``source`` is one
-    of: prior_confirmed / prior_kept / relocated_priorwidth / relocated_span /
-    detector_noprior / prior_only (no usable scores).
+    ``source``: prior_confirmed | prior_kept | relocated_priorwidth | relocated_span |
+    detector_noprior | prior_only | empty.
     """
     base = {"peak_t": None, "peak_score": 0.0, "prior_score": 0.0,
             "det_start": None, "det_end": None}
-    # No scores (scoring backend gave nothing, or no frames) -> pure leak.
+    # no scores -> prior only
     if not scores or not timestamps or len(scores) != len(timestamps):
         if prior is not None:
             return {**base, "start": prior[0], "end": prior[1], "source": "prior_only"}
         return {**base, "start": 0.0, "end": 0.0, "source": "empty"}
 
     sm = smooth(scores, cfg.smooth_k)
-    # Peak = CENTER of the top plateau (a collision spans several frames; this is
-    # the physical mid-point and is robust to float ties at the clip edges).
+    # peak = center of the top plateau
     mx = max(sm)
     plateau = [i for i, v in enumerate(sm) if v >= mx - 1e-9]
     peak_idx = plateau[len(plateau) // 2]
@@ -207,19 +145,16 @@ def ground_video(prior: tuple[float, float] | None,
         return {**base, "start": det_s, "end": det_e, "source": "detector_noprior"}
 
     px, py = prior
-    # How convinced is the model that the event is INSIDE the prior window?
+    # best score inside the prior window
     in_prior = [sm[i] for i, t in enumerate(timestamps) if px <= t <= py]
     prior_score = max(in_prior) if in_prior else 0.0
     base["prior_score"] = prior_score
 
-    # 1) Evidence points INTO the prior (peak inside, or det-span overlaps it) ->
-    #    the leak is right; keep it. This protects the ~60% leak-correct items.
+    # evidence points into the prior: keep it
     if (px <= peak_t <= py) or iou(prior, (det_s, det_e)) >= cfg.agree_iou:
         return {**base, "start": px, "end": py, "source": "prior_confirmed"}
 
-    # 2) Peak is OUTSIDE the prior. Relocate only if the model is BOTH confident at
-    #    the peak AND unconvinced inside the prior (peak beats in-prior by margin);
-    #    otherwise the signal is ambiguous -> keep the leak.
+    # peak outside the prior: relocate only if confident at the peak and unconvinced inside it
     confident = peak_score >= cfg.conf_thresh and (peak_score - prior_score) >= cfg.margin
     if not confident:
         return {**base, "start": px, "end": py, "source": "prior_kept"}
@@ -232,10 +167,6 @@ def ground_video(prior: tuple[float, float] | None,
         return {**base, "start": s, "end": e, "source": "relocated_priorwidth"}
     return {**base, "start": det_s, "end": det_e, "source": "relocated_span"}
 
-
-# ---------------------------------------------------------------------------
-# Per-frame binary prompt (referring-expression grounding)
-# ---------------------------------------------------------------------------
 
 _SYS_FRAME = (
     "You are an expert traffic-surveillance video analyst. You are shown a SINGLE "
@@ -251,10 +182,6 @@ def frame_prompt(event_phrase: str) -> str:
             "Is this event happening, or is its immediate impact clearly visible, "
             "in this frame? Answer with only Yes or No.")
 
-
-# ---------------------------------------------------------------------------
-# IO boundary — frame sampling + frame scoring (lazy heavy deps; injectable)
-# ---------------------------------------------------------------------------
 
 class FrameSampler:
     """Dense uniform frame extraction with timestamps (reuses track3.frames)."""
@@ -276,13 +203,7 @@ class FrameSampler:
 
 
 class FrameScorer:
-    """Batched single-image P(Yes) scorer over the W1 first-token logprob path.
-
-    Builds one ms-swift engine (reusing infer.build_engine so the adapter/vLLM/
-    transformers handling never diverges) and scores all (frame, event) jobs in a
-    single ``max_tokens=1`` logprob pass. Returns [] support flag false when the
-    backend can't produce logprobs, so the caller falls back to the pure leak.
-    """
+    """Batched single-image P(Yes) scorer (one max_tokens=1 logprob pass)."""
 
     def __init__(self, args):
         from swift import InferRequest, RequestConfig  # lazy
@@ -300,7 +221,7 @@ class FrameScorer:
         from track3.infer import _first_token_dist
         if not self.supported:
             print("[temporal_grounding][WARN] backend has no logprobs/top_logprobs "
-                  "— cannot score frames; emitting the pure td-window leak.")
+                  "(cannot score frames); emitting the pure td-window leak.")
             return []
         reqs = [self._InferRequest(
                     messages=[{"role": "system", "content": _SYS_FRAME},
@@ -317,16 +238,10 @@ class FrameScorer:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
 def _prior_for(tasks: dict):
-    """((X,Y) emit-strings, (X,Y) seconds) from the td else cl question, or None.
+    """((X,Y) strings, (X,Y) seconds) of the td else cl window, or (None, None).
 
-    The emit-strings are the question's verbatim timestamps with the MM:SS:ff typo
-    repaired (normalize_ts) and re-sorted by seconds, so the kept-prior path already
-    fixes the 18 colon-corrupted items and the relocation width is never absurd.
+    Timestamps are typo-repaired (normalize_ts) and sorted by seconds.
     """
     for src in ("temporal_description", "causal_linkage"):
         for it in tasks.get(src, ()):
@@ -342,13 +257,11 @@ def _prior_for(tasks: dict):
 
 def run(items_by_video: dict, videos_root: str, out_path: str, cfg: GroundConfig,
         sampler, scorer) -> list[dict]:
-    """Produce one override record per temporal_localization item.
+    """One override record per temporal_localization item.
 
     ``sampler(video_path) -> (timestamps, paths, duration)`` and
-    ``scorer(jobs) -> [P(Yes)]`` are injected (real impls above; stubs in tests).
-    Frames for every item are scored in ONE batched ``scorer`` call.
+    ``scorer(jobs) -> [P(Yes)]`` are injected; all frames are scored in one batch.
     """
-    # 1) sample frames per video that has a tl item; build the flat scoring batch.
     plans, jobs = [], []
     for vid, tasks in items_by_video.items():
         tl_items = tasks.get("temporal_localization", ())
@@ -369,11 +282,9 @@ def run(items_by_video: dict, videos_root: str, out_path: str, cfg: GroundConfig
                           "timestamps": timestamps, "duration": duration,
                           "span": (start, len(jobs))})
 
-    # 2) one batched frame-scoring pass.
     scores = scorer(jobs) if jobs else []
     have_scores = len(scores) == len(jobs) and len(jobs) > 0
 
-    # 3) per item: fuse, choose emission strings, collect records.
     records, by_source = [], defaultdict(int)
     for pl in plans:
         s = scores[pl["span"][0]:pl["span"][1]] if have_scores else []
@@ -399,10 +310,6 @@ def run(items_by_video: dict, videos_root: str, out_path: str, cfg: GroundConfig
     return records
 
 
-# ---------------------------------------------------------------------------
-# Measurement (validate on a GT that carries real temporal answers)
-# ---------------------------------------------------------------------------
-
 def _gt_interval(answer: str):
     obj = extract_interval_obj(answer)
     if not obj or "start" not in obj or "end" not in obj:
@@ -414,9 +321,8 @@ def _gt_interval(answer: str):
 
 
 def score_against_gt(records: list[dict], items_by_video: dict) -> dict:
-    """mIoU of {td-only, grounded, oracle(td,grounded)} vs the GT temporal answers,
-    plus a breakdown on the leak-correct (td IoU>0.7) vs leak-wrong (<0.3) subsets
-    — exactly the train high-confidence audit method.md §9.7.1/§9.7.3 asks for."""
+    """mIoU of td-only / grounded / oracle vs GT, plus leak-correct (td IoU > 0.7)
+    and leak-wrong (td IoU < 0.3) subsets."""
     gt, verb = {}, {}
     for vid, tasks in items_by_video.items():
         v, _ = _prior_for(tasks)
@@ -426,7 +332,7 @@ def score_against_gt(records: list[dict], items_by_video: dict) -> dict:
                 gt[it["item_index"]] = g
                 verb[it["item_index"]] = v
     if not gt:
-        print("[temporal_grounding] no GT temporal answers — skipping scoring.")
+        print("[temporal_grounding] no GT temporal answers; skipping scoring.")
         return {}
 
     td_all, gr_all, orc_all = [], [], []
@@ -473,11 +379,6 @@ def score_against_gt(records: list[dict], items_by_video: dict) -> dict:
     return metrics
 
 
-# ---------------------------------------------------------------------------
-# Train-task-file loader (build items_by_video from data/train/*.json for the
-# high-confidence audit; the per-task train files are not a single items list).
-# ---------------------------------------------------------------------------
-
 def load_train_items_by_video(train_dir: str, limit: int = 0) -> dict:
     by_video: dict = defaultdict(lambda: defaultdict(list))
     for task in ("temporal_localization", "temporal_description", "causal_linkage"):
@@ -496,10 +397,6 @@ def load_train_items_by_video(train_dir: str, limit: int = 0) -> dict:
     return by_video
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _engine_args(a):
     """A namespace shaped like infer.parse_args() for infer.build_engine."""
     from types import SimpleNamespace
@@ -508,7 +405,7 @@ def _engine_args(a):
         max_lora_rank=a.max_lora_rank, tensor_parallel_size=a.tensor_parallel_size,
         gpu_memory_utilization=a.gpu_memory_utilization, device_map=a.device_map,
         max_model_len=a.max_model_len,
-        # one IMAGE per request -> image cap only needs to be >= 1.
+        # one image per request
         num_frames=1, temporal_num_frames=0)
 
 
@@ -520,7 +417,7 @@ def main() -> None:
     src.add_argument("--model", help="Full/merged model path.")
     gsrc = p.add_mutually_exclusive_group(required=True)
     gsrc.add_argument("--test-json", help="items json (test.json or a val_gt.json).")
-    gsrc.add_argument("--train-dir", help="data/train dir — audit on auto GT.")
+    gsrc.add_argument("--train-dir", help="data/train dir: audit on auto GT.")
     p.add_argument("--videos-root", required=True)
     p.add_argument("--out", default="preds/temporal_grounding.jsonl")
     p.add_argument("--frames-root", default="data/frames_grounding")

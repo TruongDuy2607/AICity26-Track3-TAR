@@ -1,25 +1,8 @@
-"""W1 whole-video Yes/No probing: claim verification + scene attributes (PROVE tier 2).
+"""Whole-video Yes/No probing: claim verification + scene attributes.
 
-The measured generator-discriminator gap on this exact model: binary verification
-accuracy 0.925 (BCQ, leaderboard) vs narrative BERTScore ~0.49. This module points
-the strong discriminator at the weak generator's output:
-
-  * CLAIMS  (``--candidates``): decompose every narrative candidate into atomic
-    claims, probe each against the video with P(first token == "Yes") — the same
-    first-token logprob machinery as the closed-form scoring / temporal grounding —
-    and write one mean verify score per candidate. ``track3.mbr_select`` blends it
-    into the MBR utility (``score = consensus + lam * verify``); nothing is pruned,
-    so a miscalibrated probe can only re-rank, never destroy content.
-  * SCENE   (``--scene-out``): probe the closed scene-attribute vocabulary
-    (track3.evidence.SCENE_PROBE_QUESTIONS) per clip and emit the per-video
-    attribute list the Evidence-Sheet-v2 renderer consumes (``text_dossier
-    --scene-probes``). Unsure groups (winner below ``--scene-min-p``) emit nothing —
-    the sheet degrades, it never guesses.
-
-Probes reuse the bcq task template (system + "<video> question. Answer with only
-Yes or No.") to stay inside the verifier's trained register. Pure logic (claim
-decomposition / probe prompts / aggregation) has no torch/ms-swift deps and is
-CPU-tested (track3/test_claim_verify.py); the engine is injected.
+  --candidates  split each candidate into atomic claims, probe P(first token == "Yes")
+                per claim and write one mean verify score per candidate (mbr_select).
+  --scene-out   probe the closed scene vocabulary per clip (text_dossier --scene-probes).
 
 Run (claims + scene in one engine spin-up)::
 
@@ -43,13 +26,8 @@ _LEAD_TOKEN = re.compile(r"^\s*(?:yes|no|[A-D])\b[.,:)]?\s*", re.IGNORECASE)
 _YESNO_SUFFIX = " Answer with only Yes or No."
 
 
-# ---------------------------------------------------------------------------
-# Pure logic
-# ---------------------------------------------------------------------------
-
 def decompose_claims(text: str, max_claims: int = 8) -> list[str]:
-    """Atomic claims from a narrative answer: sentences with >= 4 words, leading
-    Yes/No/letter token stripped, deduped (normalized), first ``max_claims`` kept."""
+    """Deduped sentences with >= 4 words (lead Yes/No/letter stripped), at most ``max_claims``."""
     out: list[str] = []
     seen: set[str] = set()
     body = _LEAD_TOKEN.sub("", (text or "").strip(), count=1)
@@ -80,15 +58,15 @@ def scene_probe_jobs() -> list[tuple[tuple[str, str], str]]:
 
 
 def aggregate_verify(claim_probs: list[float]) -> float:
-    """One verify score per candidate = mean claim P(Yes); no claims -> neutral 0.5
-    (a claim-free candidate must not be advantaged or penalized by the blend)."""
+    """Mean claim P(Yes); neutral 0.5 when there are no claims."""
     return sum(claim_probs) / len(claim_probs) if claim_probs else 0.5
 
 
 def verify_candidates(records: list[dict], prob_fn) -> list[dict]:
-    """Per candidates-record verify scores. ``prob_fn(jobs) -> [P(Yes)]`` with jobs
-    ``[{video_id, question}]`` is injected (the real scorer below; a stub in tests).
-    Probes are deduplicated per (video_id, claim) across candidates/items."""
+    """Per-record verify scores; ``prob_fn([{video_id, question}]) -> [P(Yes)]`` is injected.
+
+    Probes are deduplicated per (video_id, claim).
+    """
     probe_key_to_pos: dict[tuple[str, str], int] = {}
     jobs: list[dict] = []
     plans = []       # (rec, [[probe positions] per candidate])
@@ -134,19 +112,12 @@ def probe_scene(video_ids: list[str], prob_fn, min_p: float = 0.5) -> list[dict]
     return out
 
 
-# ---------------------------------------------------------------------------
-# IO boundary — the whole-video P(Yes) scorer (lazy heavy deps)
-# ---------------------------------------------------------------------------
-
 class VideoYesNoScorer:
-    """Batched whole-video P(first token == "Yes") over the W1 logprob path, in the
-    bcq task register. Mirrors infer.py stage B; native video attached per request.
+    """Batched whole-video P(first token == "Yes") in the bcq register.
 
-    Requests are submitted in CHUNKS of ``batch_size``: ms-swift preprocesses a
-    batch up-front and every video-attached request decodes its clip (decord) into
-    host RAM at encode time — one giant batch over the full claim pool (~tens of
-    thousands of probes) OOM-kills the process (observed: SIGKILL at stage 5 of
-    phase3). A failed chunk degrades to neutral 0.5 for its jobs only."""
+    Requests go in chunks of ``batch_size`` because each one decodes its clip into host
+    RAM; a failed chunk yields neutral 0.5 for its jobs.
+    """
 
     def __init__(self, args, videos_root: str, batch_size: int = 256):
         from swift import InferRequest, RequestConfig  # lazy
@@ -192,10 +163,6 @@ class VideoYesNoScorer:
         return out
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _load_jsonl(path: str) -> list[dict]:
     with open(path, encoding="utf-8") as f:
         return [json.loads(l) for l in f if l.strip()]
@@ -215,7 +182,7 @@ def main() -> None:
                    help="verify-scores jsonl (claims mode).")
     # scene mode
     p.add_argument("--test-json", default="",
-                   help="items json — the clips to scene-probe.")
+                   help="items json: the clips to scene-probe.")
     p.add_argument("--scene-out", default="",
                    help="scene-attributes jsonl for text_dossier --scene-probes.")
     p.add_argument("--scene-min-p", type=float, default=0.5)
@@ -229,7 +196,7 @@ def main() -> None:
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--num-frames", type=int, default=16)
     p.add_argument("--probe-batch", type=int, default=256,
-                   help="probes per engine batch — bounds host RAM (each video-"
+                   help="probes per engine batch; bounds host RAM (each video-"
                         "attached request decord-decodes its clip at encode time).")
     a = p.parse_args()
     if not a.candidates and not a.scene_out:
@@ -259,7 +226,7 @@ def main() -> None:
         missing = [v for v in vids
                    if not os.path.exists(resolve_video(a.videos_root, v))]
         if missing:
-            print(f"[verify][WARN] {len(missing)} video(s) missing — skipped.")
+            print(f"[verify][WARN] {len(missing)} video(s) missing, skipped.")
         vids = [v for v in vids if v not in set(missing)]
         out = probe_scene(vids, scorer, min_p=a.scene_min_p)
         os.makedirs(os.path.dirname(a.scene_out) or ".", exist_ok=True)

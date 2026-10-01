@@ -1,12 +1,6 @@
-"""Batched inference over the TAR ``test.json`` with a fine-tuned Qwen3-VL.
+"""Batched inference over the TAR ``test.json`` with a fine-tuned Qwen3-VL (ms-swift).
 
-Builds a task-aware :class:`InferRequest` per test item (same system/user template
-as training), runs the ms-swift engine (vLLM by default, transformers fallback),
-applies **self-consistency voting** for the accuracy tasks, and writes a raw
-predictions jsonl consumed by :mod:`track3.make_submission`.
-
-Engine/adapter handling follows ms-swift's documented Python API
-(``examples/infer/demo_lora.py``). Tested API surface: ms-swift ≥ 3.x.
+Writes a raw predictions jsonl consumed by :mod:`track3.make_submission`.
 
 Run: ``python -m track3.infer --adapter output/ckpt --test-json data/test/test.json``
 """
@@ -33,9 +27,7 @@ from track3.tasks import (
     vote_token,
 )
 
-# Closed-family tasks whose first generated token IS the decision (per the SFT
-# targets: bcq -> "Yes"/"No", mcq -> bare letter, *_openended -> "Yes. ..."/"B. ...").
-# Used by the W1 first-token logprob scoring path (method.md §9 W1).
+# Closed tasks whose first generated token is the decision (Yes/No or A-D).
 CLOSED_TOKEN_KIND = {
     "bcq": "yesno",
     "bcq_openended": "yesno",
@@ -58,7 +50,7 @@ def parse_args() -> argparse.Namespace:
                         "package; flash_attn requires flash-attn installed).")
     p.add_argument("--max-lora-rank", type=int, default=64,
                    help="vLLM LoRA rank cap; must be >= the trained lora_rank.")
-    # --- multi-GPU engine sharding --------------------------------------------
+    # multi-GPU engine sharding
     p.add_argument("--tensor-parallel-size", type=int, default=1,
                    help="vLLM tensor parallelism: shard ONE model across N GPUs for "
                         "multi-GPU inference. Set to the CUDA_VISIBLE_DEVICES count.")
@@ -97,18 +89,18 @@ def parse_args() -> argparse.Namespace:
                         "rotations and average the first-token distributions over "
                         "option text (position/letter-bias debias; 0/1 = off, 4 = "
                         "the full cycle). Only the max_tokens=1 scoring pass sees a "
-                        "permuted question — generation prompts stay verbatim.")
+                        "permuted question; generation prompts stay verbatim.")
     p.add_argument("--vote-n", type=int, default=5,
                    help="Self-consistency samples for bcq/mcq (closed-scoring=vote).")
     p.add_argument("--vote-temp", type=float, default=0.7)
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--limit", type=int, default=0, help="Debug: first N items only.")
     p.add_argument("--tasks", nargs="*", default=None,
-                   help="Only infer these task types (e.g. mcq bcq) — to cheaply "
+                   help="Only infer these task types (e.g. mcq bcq), to cheaply "
                         "re-run a fixed subset and splice it into an existing run.")
     p.add_argument("--no-strict-format", action="store_true",
                    help="Write predictions even if any fail the post-enforcement "
-                        "parseability check (default: abort — see _report_format).")
+                        "parseability check (default: abort, see _report_format).")
     return p.parse_args()
 
 
@@ -128,16 +120,9 @@ def load_test_items(path: str) -> list[dict]:
 
 
 def build_engine(args):
-    """Construct an ms-swift engine for the base model + LoRA adapter.
-
-    The installed ms-swift exposes engines from the top-level ``swift`` package
-    (no ``swift.llm``); ``TransformersEngine`` is the non-vLLM backend. The engine
-    auto-builds the correct Qwen3-VL template, and each request carries its own
-    system prompt, so no manual template binding is needed.
-    """
+    """Construct an ms-swift engine for the base model + optional LoRA adapter."""
     from swift import BaseArguments, TransformersEngine, VllmEngine
-    # temporal frames are passed as an image list, so the per-prompt image cap
-    # must cover whichever budget is larger (base vs temporal).
+    # image cap must cover the larger of the base and temporal frame budgets
     max_frames = max(args.num_frames, args.temporal_num_frames or 0)
     common = dict(max_model_len=args.max_model_len,
                   limit_mm_per_prompt={"image": max_frames + 1, "video": 2})
@@ -148,9 +133,7 @@ def build_engine(args):
         model, adapters = args.model, None
 
     if args.backend == "vllm":
-        # Multi-GPU: tensor_parallel_size shards one model across N GPUs (the caller
-        # sets it from CUDA_VISIBLE_DEVICES). getattr keeps callers whose namespace
-        # predates these fields working (defaults => single GPU, unchanged behavior).
+        # getattr: older caller namespaces may lack these fields (defaults = single GPU)
         engine = VllmEngine(
             model, enable_lora=bool(adapters), max_loras=1,
             max_lora_rank=args.max_lora_rank,
@@ -159,7 +142,7 @@ def build_engine(args):
             gpu_memory_utilization=getattr(args, "gpu_memory_utilization", 0.9) or 0.9,
             **common)
     else:
-        # transformers backend: device_map='auto' naive-shards the model across GPUs.
+        # device_map='auto' naive-shards the model across GPUs
         engine = TransformersEngine(
             model, adapters=adapters, attn_impl=args.attn_impl,
             device_map=(getattr(args, "device_map", "") or None))
@@ -167,11 +150,7 @@ def build_engine(args):
 
 
 def _video_field(args, item, spec, frame_cache):
-    """Return (videos_list, video_hint) for the request, per task frame plan.
-
-    Temporal items get denser timestamped extract frames even when the global
-    mode is ``video`` (mirrors build_dataset; see method.md §3.3).
-    """
+    """(videos_list, video_hint) for the request, per the task's frame plan."""
     vid = item["video_id"]
     vpath = vid if os.path.isabs(vid) else os.path.join(args.videos_root, vid)
     eff_mode, eff_frames, eff_side = frame_plan(
@@ -188,17 +167,12 @@ def _video_field(args, item, spec, frame_cache):
         hint = frame_utils.timestamp_hint(fr.timestamps, fr.duration) \
             if spec.metric == "iou" else ""
         return [fr.paths], hint
-    # video mode: probe duration for the temporal task's hint. Uses the *same*
-    # shared helper as build_dataset so train/test temporal framing never diverges.
+    # video mode: duration hint for temporal items (same helper as build_dataset)
     hint = ""
     if spec.metric == "iou" and os.path.exists(vpath):
         hint = frame_utils.duration_hint(frame_utils.video_duration(vpath))
     return [vpath], hint
 
-
-# ---------------------------------------------------------------------------
-# W1 — first-token logprob scoring for the closed-family tasks (method.md §9)
-# ---------------------------------------------------------------------------
 
 def _supports_logprobs(request_config_cls) -> bool:
     import dataclasses as dc
@@ -222,11 +196,9 @@ def _canon_first_token(token: str, kind: str):
 
 
 def _first_token_dist(choice, kind: str) -> dict:
-    """{canonical token: probability} from a choice's first-token top-logprobs.
+    """{canonical token: probability} from a choice's first-token top-logprobs; {} if none.
 
-    Tolerates both dict- and object-shaped logprobs payloads (vLLM vs
-    transformers backends serialize them differently). Returns {} when the
-    backend produced no usable logprobs, so callers can fall back gracefully.
+    Handles both dict- and object-shaped logprobs (vLLM vs transformers).
     """
     import math
 
@@ -262,11 +234,8 @@ def _retoken(text: str, token: str) -> str:
 def _pool_mcq_letters(metas: list) -> dict:
     """Final letter per mcq/mcq_openended item, pooling twin distributions.
 
-    The two tasks carry the same option set on most test videos but with the
-    letters SHUFFLED (data.md §5.3), so distributions are pooled over the
-    normalized option *text* and the winner is re-expressed in each item's own
-    letters. Items without a scored twin fall back to their own argmax.
-    Reads the per-item first-token distribution from ``meta['votes']``.
+    Twins share options with shuffled letters, so ``votes`` are pooled over option text
+    and mapped back to each item's letters; unpaired items use their own argmax.
     """
     by_video: dict = {}
     for i, m in enumerate(metas):
@@ -340,13 +309,10 @@ def main() -> None:
     closed_logprob = args.closed_scoring == "logprob"
     if closed_logprob and not _supports_logprobs(RequestConfig):
         print("[infer][WARN] installed ms-swift RequestConfig has no logprobs/"
-              "top_logprobs — falling back to --closed-scoring vote.")
+              "top_logprobs; falling back to --closed-scoring vote.")
         closed_logprob = False
-    # Conditioned mcq_oe = the SFT prompt UNCHANGED + the pooled letter forced as
-    # a response_prefix ("B. "), so the explanation continues in-distribution.
-    # MEASURED (leaderboard v5-2): appending an instruction to the prompt instead
-    # drifted the answer register and cost mcq_oe −0.13 BERTScore — never modify
-    # the prompt text for this pass. Needs per-request chat_template_kwargs.
+    # Conditioned mcq_oe: the SFT prompt unchanged + the pooled letter as response_prefix.
+    # Editing the prompt text instead drifted the answer register (-0.13 BERTScore).
     import dataclasses as _dc
     supports_prefix = any(f.name == "chat_template_kwargs"
                           for f in _dc.fields(InferRequest))
@@ -354,14 +320,11 @@ def main() -> None:
                       and supports_prefix)
     if closed_logprob and not args.no_conditioned_openended and not supports_prefix:
         print("[infer][WARN] installed ms-swift InferRequest has no "
-              "chat_template_kwargs (response_prefix unsupported) — mcq_openended "
+              "chat_template_kwargs (response_prefix unsupported); mcq_openended "
               "falls back to greedy generation + leading-letter rewrite.")
 
-    # Stage A — one greedy text pass for every item that needs generated text.
-    # Strip <think>...</think> reasoning here so the raw predictions jsonl (and the
-    # submission built from it) carry only the answer. Under logprob scoring,
-    # bcq/mcq need no text (the decision IS the first token), and mcq_openended is
-    # generated in stage C conditioned on the pooled letter.
+    # Stage A: one greedy text pass. Under logprob scoring bcq/mcq need no text and
+    # mcq_openended is generated in stage C.
     skip_text = ({"bcq", "mcq"} | ({"mcq_openended"} if conditioned_oe else set())) \
         if closed_logprob else set()
     preds = [""] * len(metas)
@@ -372,16 +335,10 @@ def main() -> None:
             preds[i] = strip_reasoning(resp[j].choices[0].message.content)
 
     if closed_logprob:
-        # Stage B — first-token distribution for the closed family (W1). One
-        # deterministic max_tokens=1 request per item; the Yes/No / A-D
-        # probabilities are the decision AND the margins structural.py consumes.
+        # Stage B: first-token Yes/No / A-D distribution (decision + structural margins).
         score_idx = [i for i, m in enumerate(metas) if m["task"] in CLOSED_TOKEN_KIND]
         if score_idx:
-            # --mcq-permute R: additionally score the letter tasks under R-1 cyclic
-            # rotations of the option TEXTS and average the distributions over
-            # option text (track3.mcq_debias — position/letter-bias removal). Only
-            # this max_tokens=1 pass sees a permuted question; a malformed question
-            # falls back to the single verbatim pass.
+            # --mcq-permute R: also score R-1 cyclic option rotations (track3.mcq_debias).
             jobs = []   # (item_i, slot->original-letter mapping | None, request)
             for i in score_idx:
                 jobs.append((i, None, requests[i]))
@@ -416,8 +373,7 @@ def main() -> None:
                     metas[i]["votes"] = dist
             unscored = [i for i in score_idx if "votes" not in metas[i]]
             if unscored:
-                # Backend returned no usable logprobs — regenerate text for the
-                # items whose prediction would otherwise be empty (bcq/mcq/mcq_oe).
+                # no usable logprobs: regenerate text so these predictions aren't empty
                 print(f"[infer][WARN] no first-token logprobs for {len(unscored)} "
                       f"item(s); falling back to greedy text for those.")
                 need = [i for i in unscored if i not in gen_idx]
@@ -426,8 +382,7 @@ def main() -> None:
                     for j, i in enumerate(need):
                         preds[i] = strip_reasoning(resp[j].choices[0].message.content)
 
-        # bcq: the scored token is the prediction; bcq_openended: keep the
-        # generated explanation but force it to open with the scored token.
+        # bcq: the scored token; bcq_openended: explanation led by the scored token
         for i, m in enumerate(metas):
             dist = m.get("votes")
             if not dist:
@@ -444,10 +399,7 @@ def main() -> None:
             if metas[i]["task"] == "mcq":
                 preds[i] = letter
 
-        # Stage C — mcq_openended explanations conditioned on the pooled letter:
-        # the original SFT prompt verbatim, with the letter forced via
-        # response_prefix so the model *continues* "B. ..." in its trained
-        # register (decode prepends the prefix, so content arrives as "B. ...").
+        # Stage C: mcq_openended explanations with the pooled letter as response_prefix.
         cond_idx = [i for i in final_letters if metas[i]["task"] == "mcq_openended"]
         if conditioned_oe and cond_idx:
             cond_reqs = [InferRequest(
@@ -459,23 +411,17 @@ def main() -> None:
                 text = strip_reasoning(resp[j].choices[0].message.content)
                 preds[i] = _retoken(text, final_letters[i])
         else:
-            # No conditioned pass: keep the in-distribution greedy explanation,
-            # only rewrite the leading letter (measured safe: bcq_oe −0.003).
+            # no conditioned pass: only rewrite the leading letter
             for i in cond_idx:
                 preds[i] = _retoken(preds[i], final_letters[i])
     elif args.vote_n > 1:
-        # Legacy self-consistency voting (persists vote counts for structural.py).
+        # legacy self-consistency voting
         vote_idx = [i for i, m in enumerate(metas)
                     if get_task(m["task"]).metric in (METRIC_ACC_YESNO, METRIC_ACC_LETTER)]
         if vote_idx:
             preds = _vote(engine, requests, metas, preds, vote_idx, args, extra, InferRequest, RequestConfig)
 
-    # 3) STRICT FORMAT ENFORCEMENT — the single choke-point. Coerce every output
-    #    to the exact string the official grader parses, so the predictions jsonl
-    #    is already submission-ready (scoring it raw == scoring the CSV, and
-    #    temporal is fenced JSON not prose). The pre-enforcement text (reasoning
-    #    already stripped / vote already taken) is kept under "raw_pred" for audit;
-    #    make_submission / eval_local re-apply submission() idempotently.
+    # Enforce the grader-exact format; the pre-enforcement text is kept as raw_pred.
     bad: dict[str, list] = {}
     with open(args.out, "w", encoding="utf-8") as f:
         for it, raw_pred in zip(metas, preds):
@@ -486,16 +432,14 @@ def main() -> None:
             rec = {"item_index": it["item_index"], "video_id": it["video_id"],
                    "task": it["task"], "prediction": pred, "raw_pred": raw_pred}
             if it.get("votes"):
-                rec["votes"] = it["votes"]  # margins for track3.structural rules 4.2/4.3
+                rec["votes"] = it["votes"]  # margins for track3.structural
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print(f"Wrote {len(metas)} predictions to {args.out}")
     _report_format(metas, bad, strict=not args.no_strict_format)
 
 
 def _report_format(metas, bad: dict, strict: bool) -> None:
-    """Per-task parseability report over the enforced predictions. Enforcement
-    guarantees 0 bad; this is a regression tripwire so a future extractor/grader
-    drift can never ship silently."""
+    """Per-task parseability report; a tripwire, since enforcement should leave 0 bad."""
     by_task: dict[str, int] = {}
     for it in metas:
         by_task[it["task"]] = by_task.get(it["task"], 0) + 1
@@ -509,7 +453,7 @@ def _report_format(metas, bad: dict, strict: bool) -> None:
     if total_bad and strict:
         raise SystemExit(
             f"[infer] {total_bad} prediction(s) are not grader-parseable after "
-            f"enforcement: {bad}. This should be impossible — investigate "
+            f"enforcement: {bad}. This should be impossible; investigate "
             f"tasks.enforce_format / the official extractors. Pass "
             f"--no-strict-format to write anyway.")
 
@@ -522,7 +466,7 @@ def _vote(engine, requests, metas, preds, vote_idx, args, extra, InferRequest, R
     for j, i in enumerate(vote_idx):
         spec = get_task(metas[i]["task"])
         votes = Counter(vote_token(spec, c.message.content) for c in resp[j].choices)
-        metas[i]["votes"] = dict(votes)  # margins for track3.structural rules 4.2/4.3
+        metas[i]["votes"] = dict(votes)  # margins for track3.structural
         preds[i] = votes.most_common(1)[0][0]
     return preds
 

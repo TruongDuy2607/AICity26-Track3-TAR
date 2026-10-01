@@ -1,12 +1,4 @@
-"""Uniform / timestamped video frame extraction.
-
-Used in ``extract`` frame-mode (see method.md §3.3). Pre-extracting frames makes
-training I/O deterministic and fast across epochs, and lets us tell the model the
-timestamp of each frame for the temporal-localization task.
-
-Decoding backend preference: PyAV/torchvision/decord are heavy; we use OpenCV,
-which is already a project dependency and handles the 8 source containers well.
-"""
+"""Uniform / timestamped video frame extraction (OpenCV)."""
 from __future__ import annotations
 
 import os
@@ -35,11 +27,7 @@ def extract_uniform_frames(
     max_side: int = 448,
     overwrite: bool = False,
 ) -> FrameResult:
-    """Sample ``num_frames`` evenly across the video and write JPEGs.
-
-    Returns frame paths, per-frame timestamps (s) and duration (s). Idempotent:
-    re-uses existing frames unless ``overwrite`` is set.
-    """
+    """Sample ``num_frames`` evenly and write JPEGs; reuses existing frames unless ``overwrite``."""
     os.makedirs(out_dir, exist_ok=True)
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -47,7 +35,7 @@ def extract_uniform_frames(
     n_total, fps = _video_meta(cap)
     duration = (n_total / fps) if fps > 0 else 0.0
 
-    if n_total <= 0:  # some containers don't report frame count; fall back to a stream read
+    if n_total <= 0:  # no frame count reported: fall back to a stream read
         return _extract_streaming(cap, out_dir, num_frames, max_side, fps, overwrite)
 
     indices = _even_indices(n_total, num_frames)
@@ -126,13 +114,7 @@ def video_duration(video_path: str) -> float:
 
 
 def duration_hint(duration: float) -> str:
-    """Total-duration hint for native-``video``-mode temporal items.
-
-    In native video mode Qwen3-VL keeps the real fps/duration and time-aligned
-    position IDs (unlike an image list — see :func:`track3.tasks.frame_plan`), so
-    the prompt only needs the wall-clock length to let the model emit MM:SS. Shared
-    by build_dataset (train) and infer (test) so the temporal framing never drifts.
-    """
+    """Total-duration hint for native-video temporal items (shared by train and test)."""
     if duration <= 0:
         return ""
     return (
@@ -143,14 +125,7 @@ def duration_hint(duration: float) -> str:
 
 
 def timestamp_hint(stamps: list[float], duration: float) -> str:
-    """Explicit time-axis hint injected into the prompt for temporal tasks.
-
-    Gives the model the discrete timestamps of the frames it is shown so it can
-    anchor the queried event to wall-clock ``MM:SS`` (the temporal-localization
-    lever, see method.md §3.3). The instruction nudges the model to pick start/end
-    *from / between* the visible frame timestamps rather than guessing — without
-    changing the ``{"start","end"}`` output schema the IoU grader expects.
-    """
+    """Frame-timestamp hint for temporal items in extract mode."""
     sampled = ", ".join(format_timestamp(s) for s in stamps)
     return (
         f"Video duration: {format_timestamp(duration)} (MM:SS). "

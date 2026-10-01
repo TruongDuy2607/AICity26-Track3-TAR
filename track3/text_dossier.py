@@ -1,73 +1,15 @@
-"""Collision-Dossier text generation for the 4 BERTScore paragraph tasks.
+"""Collision-Dossier text generation for the BERTScore paragraph tasks.
 
-ISOLATED, REMOVABLE add-on (like ``temporal_grounding`` / the retired RFT): a
-single module + ``scripts/text_dossier.sh``. It touches NO existing decode path —
-it only *produces* a ``{item_index, task, prediction}`` jsonl that a NEW
-``track3.structural`` rule ``--text-override`` splices over the model's text
-predictions. Removal = ``git rm track3/text_dossier.py scripts/text_dossier.sh``
-+ revert the ``apply_text_override`` hook in ``structural.py``.
+Writes a ``{item_index, task, prediction}`` jsonl for ``structural --text-override``.
+Per clip:
 
-----------------------------------------------------------------------------
-WHY (the leaderboard decomposition — see the analysis this followed)
-----------------------------------------------------------------------------
-Temporal is solved (the per-frame grounding put mIoU at rank-1 level). After that,
-**100 % of the gap to rank-1 is the four free-text BERTScore tasks that narrate
-collision dynamics**: ``temporal_description``, ``causal_linkage``,
-``video_summarization``, ``open_qa``. Rank-1 proves it: they score WORSE than us on
-BCQ/MCQ (no structural pairing) yet rank #1 purely on these four columns. Matching
-their text level while keeping our structural wins lands ≈0.62 — a decisive #1.
+1. ``clip_facts``: evidence sheet from the released questions + our predictions.
+2. One grounded dossier pass over the video, seeded with the facts (skipped with
+   ``--direct``, which renders straight from the evidence sheet).
+3. Per target task, render the answer from the dossier/sheet + the verbatim question.
+4. ``calibrate_length`` + the task's ``submission`` enforcement.
 
-The four tasks are not a register problem (curating phrasing was tried and did not
-move them); the bottleneck is CONTENT — accurately narrating *which vehicle hit
-which, in what order, why, and the result* — which our 8B model trained mostly on
-normal-flow surveillance does poorly.
-
-----------------------------------------------------------------------------
-KEY STRUCTURAL INSIGHT — the text tasks leak content to each other
-----------------------------------------------------------------------------
-On every clip ALL text tasks describe THE SAME single collision, and the OTHER
-tasks' questions / our own high-accuracy answers hand us the facts for free:
-
-  * ``temporal_localization`` question NAMES the event as a clean referring
-    expression: "When does *the T-bone collision between the black SUV and the
-    black sedan* occur?".
-  * ``mcq`` question + our chosen option (MCQ accuracy ~0.80+) gives the
-    consequence: "...direct consequence... -> Both vehicles are disabled and stall
-    in the middle of the intersection".
-  * ``temporal_description`` / ``causal_linkage`` questions carry the collision
-    window ``[X, Y]`` (the same timestamps as the temporal leak).
-  * ``bcq_openended`` answers carry one-sentence verified observations.
-
-So: assemble a per-clip FACT SHEET from the released questions + our predictions,
-make ONE grounded "dossier" pass over the video (the single perception step), then
-RENDER each task answer from the dossier in that task's register + length. One good
-dossier lifts all four columns at once, and every fact is sourced from the released
-test questions or our own outputs (FAQ-clean — no test annotation).
-
-----------------------------------------------------------------------------
-ALGORITHM (per clip)
-----------------------------------------------------------------------------
-1. ``clip_facts`` — event phrase (tl question), window ``[X,Y]`` (td/cl question),
-   consequence (mcq question + our chosen letter), observations (bcq_oe answers).
-2. ONE dossier generation over the video, seeded with the fact sheet, emitting a
-   labelled SCENE / VEHICLES / SEQUENCE / CAUSE / AFTERMATH account with timestamps.
-3. Per target task, RENDER the answer from (dossier [+ video] + verbatim question)
-   in the task's concise factual register.
-4. ``calibrate_length`` (trim to the per-task train-median budget; never pad) +
-   the task's own ``submission`` enforcement (guaranteed non-empty, no <think>).
-
-Output jsonl line: ``{item_index, video_id, task, prediction, source}``. Items NOT
-covered fall back to the model's own text (the override is partial-safe), so this
-degrades gracefully and is gated on curated-val before any submission.
-
-NOTE (v5-2 register lesson): feeding the model an analysis + question is OUT of the
-SFT distribution and rescaled BERTScore is sensitive to register drift — so this
-NEVER ships without a positive delta on the curated-val gate (postprocess.sh with
-GT_JSON=val_gt_curated.json). Defaults keep the video attached during the render
-(``render_with_video``) to stay as close to the SFT input as possible.
-
-Heavy deps (ms-swift, torch) are imported lazily so the pure assembly logic
-(facts / prompts / length) is unit-testable on a CPU dev box with a stub generator.
+Items not covered keep the model's own text (the override is partial-safe).
 """
 from __future__ import annotations
 
@@ -95,7 +37,7 @@ from track3.structural import (
 from track3.tasks import extract_letter, extract_yesno, get_task, strip_reasoning
 from track3.temporal_grounding import parse_event_phrase
 
-# Default target set: the 4 long-narrative BERTScore tasks (proven +0.0268 mean).
+# Default targets: the long-narrative BERTScore tasks.
 TARGET_TASKS = (
     "temporal_description",
     "causal_linkage",
@@ -103,21 +45,13 @@ TARGET_TASKS = (
     "video_summarization",
 )
 
-# P1 extension (opt-in via --tasks): the remaining BERTScore text tasks the dossier
-# can also serve — they are content gaps too (measured: SD .381 vs .410, MCQ-OE .777
-# vs .831, BCQ-OE .582 vs .606). scene_description is the dossier's SCENE part; the
-# *_openended twins reuse the dossier for the EXPLANATION while the leading token
-# (letter / Yes-No) is kept from the model/structural prediction. Gate on curated-val.
+# Opt-in extra targets (via --tasks).
 EXTENDED_TASKS = TARGET_TASKS + ("scene_description", "mcq_openended", "bcq_openended")
 
-# Tasks whose answer is "<token>. <explanation>": render the explanation from the
-# dossier, then restore the reliable leading token. In the full pipeline structural
-# rules 4.2/4.3 refine the token again (they run AFTER --text-override).
+# "<token>. <explanation>" tasks: render the explanation, keep the model's leading token.
 _CLOSED_TWIN = frozenset({"mcq_openended", "bcq_openended"})
 
-# Per-task train-GT median answer length in characters (data.md §2) — the length
-# budget the render is trimmed toward (never padded). BERTScore-rescaled penalizes
-# gross length mismatch; the budget caps runaway generations without cutting content.
+# Per-task train-GT median answer length (chars): the trim budget (never padded).
 LENGTH_TARGET = {
     "temporal_description": 394,
     "causal_linkage": 657,
@@ -128,27 +62,16 @@ LENGTH_TARGET = {
     "bcq_openended": 97,    # "Yes./No. <one-sentence reason>"
 }
 
-# causal_linkage / temporal_description answers reference the question's window in
-# the train register; rule 4.4 (timestamp_echo) is the post-hoc safety net but we
-# also ask the render to include them so the echo is natural, not bolted on.
+# Answers that should reference the question's [X,Y] window.
 _WINDOW_TASKS = frozenset({"causal_linkage", "temporal_description"})
 
 
-# ---------------------------------------------------------------------------
-# Pure assembly logic — no ms-swift / torch (unit-testable on the dev box)
-# ---------------------------------------------------------------------------
-
-# The per-clip fact container IS the canonical Evidence Sheet v2 (track3.evidence)
-# — one schema shared verbatim with the SFT dataset builder, so the direct-mode
-# render prompt can never diverge from what the model was trained on.
+# legacy alias of the shared evidence sheet
 ClipFacts = EvidenceSheet
 
 
 def _mcq_facts(tasks: dict, preds: dict) -> tuple[str, str]:
-    """(cause, consequence) = the chosen option TEXTS of BOTH mcq-family items —
-    our high-accuracy answers re-used as verified facts. Root-cause/fault stems
-    feed 'cause' (evidence.classify_stem), the rest 'consequence'; duplicate
-    option texts (the shuffled twins, data.md §5.3) dedupe to one line."""
+    """(cause, consequence): option texts of our chosen mcq/mcq_openended letters (deduped)."""
     cause = consequence = ""
     seen: set[str] = set()
     for src in ("mcq", "mcq_openended"):
@@ -185,14 +108,10 @@ def _observations(tasks: dict, preds: dict, limit: int = 2) -> list[str]:
 
 def clip_facts(tasks: dict, preds: dict | None = None,
                scene: tuple[str, ...] = ()) -> EvidenceSheet:
-    """Assemble the per-clip Evidence Sheet v2 from the released questions + our
-    own predictions (PROVE.md §1 tier 1).
+    """Per-clip evidence sheet from one video's ``{task_type: [items]}`` + our predictions.
 
-    ``tasks`` is one video's ``{task_type: [items]}`` (from
-    ``structural.load_items_by_video``). ``preds`` (item_index -> record) is
-    optional — without it only the question-derived facts (event, window, cast)
-    are available, which is enough to run and is what the unit tests exercise.
-    ``scene`` is the clip's W1-probed attribute list (claim_verify --scene-out).
+    Without ``preds`` only question-derived facts (event, window, cast) are filled;
+    ``scene`` comes from ``claim_verify --scene-out``.
     """
     preds = preds or {}
     video_id = ""
@@ -201,7 +120,7 @@ def clip_facts(tasks: dict, preds: dict | None = None,
         video_id = it.get("video_id", video_id)
         event = parse_event_phrase(it.get("question", "")) or event
         break
-    if not video_id:  # no tl item — take any item's video_id
+    if not video_id:  # no tl item: take any item's video_id
         for its in tasks.values():
             if its:
                 video_id = its[0].get("video_id", "")
@@ -230,8 +149,6 @@ def clip_facts(tasks: dict, preds: dict | None = None,
         observations=_observations(tasks, preds),
     )
 
-
-# --- prompts ---------------------------------------------------------------
 
 SYS_DOSSIER = (
     "You are an expert traffic-accident analyst. You are shown a short traffic "
@@ -293,9 +210,7 @@ _LEAD = re.compile(r"^\s*(?:yes|no|[A-D])\b[.,:)]?\s*", re.IGNORECASE)
 
 
 def _twin_token(task: str, item: dict, preds: dict) -> str:
-    """Reliable leading token for a *_openended twin, taken from the MODEL/structural
-    prediction (never the dossier): mcq_openended -> a letter, bcq_openended -> Yes/No.
-    Falls back to a safe default when the prediction is missing/unparseable."""
+    """Leading token (letter or Yes/No) for a *_openended twin, from the model prediction."""
     p = (preds.get(str(item["item_index"])) or {}).get("prediction") or ""
     if task == "mcq_openended":
         return extract_letter(p) or "A"
@@ -311,9 +226,7 @@ def _prefix_token(text: str, token: str) -> str:
 def calibrate_length(text: str, budget: int) -> str:
     """Trim ``text`` to <= ``budget`` chars on a sentence boundary; never pad.
 
-    Keeps whole sentences until the next would overflow the budget. If even the
-    first sentence overflows, hard-cut (so a runaway generation can't blow up the
-    submission). ``budget <= 0`` disables trimming.
+    Hard-cuts when the first sentence alone overflows. ``budget <= 0`` disables.
     """
     text = (text or "").strip()
     if budget <= 0 or len(text) <= budget:
@@ -329,18 +242,8 @@ def calibrate_length(text: str, budget: int) -> str:
     return out
 
 
-# ---------------------------------------------------------------------------
-# IO boundary — the video-grounded generator (lazy heavy deps; injectable)
-# ---------------------------------------------------------------------------
-
 class DossierGenerator:
-    """Batched text generation over the ms-swift engine (reuses infer.build_engine
-    so adapter / vLLM / transformers handling never diverges).
-
-    ``__call__(jobs)`` takes ``[{system, user, video}]`` (``video`` is a path or
-    None) and returns one generated string per job (``<think>`` stripped). Native
-    video is attached when ``video`` is set, matching the SFT input distribution.
-    """
+    """Batched generation over the ms-swift engine: ``[{system, user, video}] -> [text]``."""
 
     def __init__(self, args, max_new_tokens: int = 512, temperature: float = 0.0,
                  batch_size: int = 256):
@@ -363,15 +266,9 @@ class DossierGenerator:
         return self._InferRequest(**kw)
 
     def __call__(self, jobs: list[dict]) -> list[str]:
-        """Chunked batched generation, resilient to a single bad video.
+        """Generate in chunks of ``batch_size`` (bounds host RAM).
 
-        Requests go to ``engine.infer`` in chunks of ``batch_size``: ms-swift
-        preprocesses a batch up-front and every video-attached request decord-
-        decodes its clip into host RAM at encode time, so one giant batch (e.g.
-        the K-sample candidate pool, ~4k requests) OOM-kills the process. Within
-        a failed chunk we retry per-request so one corrupt clip only loses its
-        own item (returns "" -> the caller leaves it to the model's own text).
-        Missing files are pre-filtered in ``run`` (cheaper).
+        A failed chunk is retried per request; a failed request yields "".
         """
         out: list[str] = []
         for lo in range(0, len(jobs), self.batch_size):
@@ -395,10 +292,6 @@ class DossierGenerator:
         return out
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
 @dataclass
 class DossierConfig:
     tasks: tuple[str, ...] = TARGET_TASKS
@@ -407,14 +300,10 @@ class DossierConfig:
     dossier_max_tokens: int = 512
     render_max_tokens: int = 400
     temperature: float = 0.0
-    # DIRECT mode: skip the 2-pass analysis and render straight from the evidence
-    # sheet (evidence.render_evidence_prompt) — the interface the render-SFT-distilled
-    # model was trained on. Default off -> the classic 2-pass dossier is unchanged.
+    # direct: render straight from the evidence sheet (no analysis pass)
     direct: bool = False
     fact_policy: str = "video-priority"
-    # PROVE tier 3 — K-candidate sampling for the MBR ensemble (mbr_select.py):
-    # candidate 0 is the greedy full-evidence render; candidates 1..K-1 are sampled
-    # (sample_temperature) under fact-subset jitter (direct mode). 1 = off.
+    # MBR candidate pool: greedy + (n_samples - 1) sampled renders; 1 = off
     n_samples: int = 1
     sample_temperature: float = 0.8
     candidates_out: str = ""         # write {item_index, task, candidates} jsonl here
@@ -429,38 +318,29 @@ def _budget(task: str, cfg: DossierConfig) -> int:
 
 def _finalize(text: str, task: str, item: dict, preds: dict,
               cfg: DossierConfig) -> str:
-    """Length-calibrate + restore the closed-twin token + format-enforce ONE render;
-    '' when the render was empty (the caller falls back to the model's own text)."""
+    """Length-calibrate, restore the twin token and format-enforce one render; '' if empty."""
     if not (text or "").strip():
         return ""
     text = calibrate_length(text, _budget(task, cfg))
-    if task in _CLOSED_TWIN:  # dossier supplies the reason; keep the closed token
+    if task in _CLOSED_TWIN:
         text = _prefix_token(text, _twin_token(task, item, preds))
-    return get_task(task).submission(text)  # enforce non-empty, strip tags
+    return get_task(task).submission(text)
 
 
 def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
         cfg: DossierConfig, dossier_gen, render_gen=None, sample_gen=None,
         scene_map: dict | None = None, exists_fn=os.path.exists) -> list[dict]:
-    """Produce one override record per (clip, target task) item.
+    """One override record per (clip, target task) item.
 
-    ``dossier_gen(jobs)`` runs the per-clip video pass; ``render_gen`` (defaults to
-    ``dossier_gen``) runs the greedy per-task render; ``sample_gen`` (defaults to
-    ``render_gen``) runs the temperature-sampled candidate renders when
-    ``cfg.n_samples > 1``. All are injected (the real :class:`DossierGenerator`
-    above; stubs in the tests) and each family is generated in ONE batched call.
-    ``scene_map`` ({video_id: [scene attributes]}, from ``claim_verify
-    --scene-out``) feeds the evidence sheet's Scene line.
-
-    Clips whose video file is absent (``exists_fn``) are skipped — their items
-    fall back to the model's own text (the override is partial-safe). Tests inject
-    ``exists_fn=lambda _: True`` to use fake paths.
+    ``dossier_gen`` / ``render_gen`` / ``sample_gen`` are injected ``jobs -> [text]``
+    generators (render_gen defaults to dossier_gen, sample_gen to render_gen), each
+    run as one batch. Clips without a video (``exists_fn``) are skipped.
     """
     render_gen = render_gen or dossier_gen
     scene_map = scene_map or {}
     target = set(cfg.tasks)
 
-    # 1) one clip per video with a target item AND a video (facts always built).
+    # one clip per video with a target item and an existing video
     clips, missing = [], 0
     for vid, tasks in items_by_video.items():
         if not any(tasks.get(t) for t in target):
@@ -473,15 +353,14 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
         clips.append({"vid": vid, "tasks": tasks, "facts": facts, "vpath": vpath})
     if missing:
         print(f"[text_dossier][WARN] {missing} clip(s) have no video under "
-              f"{videos_root} — skipped (those items keep the model's text). "
+              f"{videos_root}, skipped (those items keep the model's text). "
               "For a val split set GROUND_VIDEOS_ROOT=$TRAIN_VIDEOS_ROOT.")
 
     if cfg.direct:
-        # DIRECT: no analysis pass — render straight from the evidence sheet (parity
-        # with the render-SFT-distilled model's training interface).
+        # direct: no analysis pass
         dossiers = [None] * len(clips)
     else:
-        # 1b) one analysis job per clip, then render conditioned on the analysis.
+        # one analysis (dossier) job per clip
         dossier_jobs = [{"system": SYS_DOSSIER, "user": dossier_prompt(c["facts"]),
                          "video": c["vpath"]} for c in clips]
         dossiers = dossier_gen(dossier_jobs) if dossier_jobs else []
@@ -491,11 +370,11 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
                   "the model's own text).")
             dossiers = [""] * len(dossier_jobs)
 
-    # 2) one greedy render job per (clip, target task) item.
+    # one greedy render job per (clip, target task) item
     plans, render_jobs = [], []
     for clip, dossier in zip(clips, dossiers):
         if not cfg.direct and not dossier:
-            continue  # no dossier for this clip -> leave its items to the model
+            continue  # no dossier: leave to the model
         for task in cfg.tasks:
             for it in clip["tasks"].get(task, ()):
                 question = it.get("question", "")
@@ -517,10 +396,8 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
               f"{len(render_jobs)} items; emitting no override.")
         return _write([], out_path)
 
-    # 2b) PROVE tier 3 — K-1 sampled candidates per item. Direct mode additionally
-    #     jitters the evidence sheet per candidate (one optional fact dropped —
-    #     mirrors the training noise, decorrelates the MBR pool). A sampling
-    #     failure only loses the extra candidates, never the greedy override.
+    # K-1 sampled candidates per item (direct mode jitters the sheet); a failure here
+    # only loses the extra candidates.
     samples_by_plan: list[list[str]] = [[] for _ in plans]
     if cfg.n_samples > 1 and plans:
         sgen = sample_gen or render_gen
@@ -544,10 +421,9 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
                 samples_by_plan[pi].append(text)
         else:
             print(f"[text_dossier][WARN] sample generator returned {len(sampled)} of "
-                  f"{len(sample_jobs)} candidates — greedy-only (no MBR pool).")
+                  f"{len(sample_jobs)} candidates; greedy-only (no MBR pool).")
 
-    # 3) finalize every candidate identically (MBR must choose among
-    #    submission-ready texts); collect the greedy override + the candidate pool.
+    # finalize every candidate identically so MBR picks among submission-ready texts
     records, cand_records, failed = [], [], 0
     for pi, (pl, text) in enumerate(zip(plans, renders)):
         task = pl["task"]
@@ -567,7 +443,7 @@ def run(items_by_video: dict, preds: dict, videos_root: str, out_path: str,
                         "task": task, "prediction": final,
                         "source": "render" if cfg.direct else "dossier"})
     if failed:
-        print(f"[text_dossier][WARN] {failed} render(s) empty/failed — left to the model.")
+        print(f"[text_dossier][WARN] {failed} render(s) empty/failed, left to the model.")
     if cfg.candidates_out:
         os.makedirs(os.path.dirname(cfg.candidates_out) or ".", exist_ok=True)
         with open(cfg.candidates_out, "w", encoding="utf-8") as f:
@@ -604,10 +480,6 @@ def _load_preds(path: str) -> dict:
     return out
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def _engine_args(a):
     """A namespace shaped like infer.parse_args() for infer.build_engine."""
     from types import SimpleNamespace
@@ -628,7 +500,7 @@ def main() -> None:
     p.add_argument("--test-json", required=True,
                    help="items json (test.json or a val_gt.json).")
     p.add_argument("--pred", default="",
-                   help="predictions jsonl (post-structural preferred) — supplies "
+                   help="predictions jsonl (post-structural preferred); supplies "
                         "the mcq consequence + bcq observations for the fact sheet.")
     p.add_argument("--videos-root", required=True)
     p.add_argument("--out", default="preds/text_dossier.jsonl")
@@ -645,18 +517,18 @@ def main() -> None:
     p.add_argument("--max-model-len", type=int, default=8192)
     p.add_argument("--num-frames", type=int, default=16)
     p.add_argument("--gen-batch", type=int, default=256,
-                   help="requests per engine batch — bounds host RAM (each video-"
+                   help="requests per engine batch; bounds host RAM (each video-"
                         "attached request decord-decodes its clip at encode time).")
     # dossier knobs (DossierConfig)
     p.add_argument("--direct", action="store_true",
                    help="skip the analysis pass; render straight from the evidence "
-                        "sheet — parity with the render-SFT-distilled model.")
+                        "sheet (parity with the render-SFT-distilled model).")
     p.add_argument("--fact-policy", choices=["video-priority", "trust"],
                    default="video-priority", help="direct-mode fact-sheet header policy.")
     p.add_argument("--scene-probes", default="",
                    help="scene-attributes jsonl (claim_verify --scene-out) feeding "
                         "the evidence sheet's Scene line; empty = no Scene line.")
-    # PROVE tier 3 — MBR candidate pool (consumed by track3.mbr_select).
+    # MBR candidate pool (consumed by track3.mbr_select)
     p.add_argument("--n-samples", type=int, default=1,
                    help="candidates per item: 1 greedy + N-1 sampled under fact "
                         "jitter (direct mode). 1 = off.")
@@ -666,7 +538,7 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=0, help="fact-jitter determinism.")
     p.add_argument("--no-render-video", action="store_true",
                    help="render text-only from the dossier (cheaper; further from "
-                        "the SFT input distribution — gate on curated-val).")
+                        "the SFT input distribution; gate on curated-val).")
     p.add_argument("--length-tol", type=float, default=0.3,
                    help="length budget = train-median*(1+tol); negative disables.")
     p.add_argument("--dossier-max-tokens", type=int, default=512)
@@ -695,14 +567,13 @@ def main() -> None:
                     rec = json.loads(line)
                     scene_map[rec["video_id"]] = rec.get("scene") or []
     elif a.scene_probes:
-        print(f"[text_dossier][WARN] scene probes {a.scene_probes} not found — "
+        print(f"[text_dossier][WARN] scene probes {a.scene_probes} not found; "
               "no Scene line.")
 
     eargs = _engine_args(a)
     dossier_gen = DossierGenerator(eargs, a.dossier_max_tokens, a.temperature,
                                    batch_size=a.gen_batch)
-    # The render/sample passes need different max_tokens/temperature; reuse the
-    # same engine (a DossierGenerator view with its own RequestConfig).
+    # render/sample passes reuse the same engine with their own RequestConfig
     from swift import RequestConfig  # lazy
 
     def _gen_view(max_tokens: int, temperature: float):

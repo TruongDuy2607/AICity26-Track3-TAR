@@ -8,22 +8,17 @@ TRACK3_ROOT="${TRACK3_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 export TRACK3_ROOT
 export HERE="$TRACK3_ROOT"
 
-# --- Hugging Face token (secret; same pattern as configs/wandb.txt) -------------
-# Auto-loaded from configs/hf.txt (gitignored) when HF_TOKEN isn't already
-# exported; override HF_TOKEN_FILE to point elsewhere. Empty token = scripts skip
-# `hf auth login` (public models still work from the local cache).
+# HF token: auto-loaded from configs/hf.txt (gitignored) unless HF_TOKEN is exported.
+# Empty token = scripts skip `hf auth login`.
 _HF_TOKEN_FILE="${HF_TOKEN_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hf.txt}"
 if [ -z "${HF_TOKEN:-}" ] && [ -f "$_HF_TOKEN_FILE" ]; then
     HF_TOKEN="$(tr -d '[:space:]' < "$_HF_TOKEN_FILE")"
 fi
 export HF_TOKEN="${HF_TOKEN:-}"
 
-# --- raw TAR dataset layout ---------------------------------------------------
-# Expected on-disk layout (as downloaded):
-#   $TAR_ROOT/train/<task>.json        (bcq.json, mcq.json, ... 10 files)
-#   $TAR_ROOT/train/videos/<video_id>  (video_id resolves under here)
-#   $TAR_ROOT/test/test.json
-#   $TAR_ROOT/test/videos/<video_id>
+# Raw TAR layout:
+#   $TAR_ROOT/train/<task>.json, $TAR_ROOT/train/videos/<video_id>
+#   $TAR_ROOT/test/test.json,    $TAR_ROOT/test/videos/<video_id>
 
 export TAR_ROOT="${TAR_ROOT:-/home/jovyan/minh-workspace/duy/TAR-AICity26/data}"
 export ANN_DIR="${ANN_DIR:-$TAR_ROOT/train}"
@@ -31,11 +26,10 @@ export TRAIN_VIDEOS_ROOT="${TRAIN_VIDEOS_ROOT:-$TAR_ROOT/train/videos}"
 export TEST_JSON="${TEST_JSON:-$TAR_ROOT/test/test.json}"
 export TEST_VIDEOS_ROOT="${TEST_VIDEOS_ROOT:-$TAR_ROOT/test/videos}"
 
-# Default video root used by inference (the real test set). Local held-out eval
-# (scripts/eval.sh) overrides this to TRAIN_VIDEOS_ROOT since val is held out of train.
+# Inference video root (scripts/eval.sh switches it to TRAIN_VIDEOS_ROOT for val).
 export VIDEOS_ROOT="${VIDEOS_ROOT:-$TEST_VIDEOS_ROOT}"
 
-# --- pipeline outputs (kept separate from the raw dataset) --------------------
+# Pipeline outputs
 export DATA_DIR="${DATA_DIR:-$TRACK3_ROOT/data/processed}"    # built train/val jsonl + val_gt.json
 export OUTPUT_DIR="${OUTPUT_DIR:-$TRACK3_ROOT/output}"        # checkpoints
 export SUBMIT_DIR="${SUBMIT_DIR:-$TRACK3_ROOT/submissions}"

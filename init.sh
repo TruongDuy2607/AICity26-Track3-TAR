@@ -11,7 +11,7 @@ export MODEL="Qwen/Qwen3-VL-32B-Instruct"
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 
 # SECRETS (optional)
-# Hugging Face token — only if MODEL or the dataset needs auth. Empty = skip login.
+# Hugging Face token: only if MODEL or the dataset needs auth. Empty = skip login.
 export HF_TOKEN=""
 
 # Weights & Biases. To DISABLE wandb: leave WANDB_API_KEY empty AND uncomment the

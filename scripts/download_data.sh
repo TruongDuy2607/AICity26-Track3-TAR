@@ -7,7 +7,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$HERE/configs/common.sh"
 
 REPO="nvidia/PhysicalAI-Traffic-Anomaly-Reasoning"
-mkdir -p "$TAR_ROOT"   # = $TRACK3_ROOT/data by default (see configs/common.sh)
+mkdir -p "$TAR_ROOT"
 
 echo "[download] annotations + test manifest from $REPO ..."
 huggingface-cli download "$REPO" --repo-type dataset --local-dir "$TAR_ROOT" \

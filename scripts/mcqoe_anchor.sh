@@ -1,25 +1,12 @@
 #!/usr/bin/env bash
-# Option-anchored mcq_openended (1) — close the one column a competitor beats us on.
-# ISOLATED add-on: this script + track3/mcqoe_anchor.py (+ its test) are the whole
-# feature. It only produces a {item_index,task,prediction} override jsonl (mcq_openended
-# only) in the text_dossier shape, consumed by the existing
-# `track3.structural --text-override` hook. Removal = git rm both files. Degrades to
-# the model on any uncovered item, so gate on the BOARD.
-#
-# ---------------------------------------------------------------------------
-# MODE=anchor  (V1, deterministic, NO model) — "X. <chosen option text>":
+# Option-anchored mcq_openended override (see track3/mcqoe_anchor.py).
+#   MODE=anchor  deterministic "X. <chosen option text>" (no model):
 #     PRED=preds/experiment-1/pred-040629-m3.struct.jsonl \
 #       OUT=preds/mcqoe_anchor.jsonl MODE=anchor bash scripts/mcqoe_anchor.sh
-#
-# MODE=render  (V2, model) — option-anchored one-sentence render (+grounding):
+#   MODE=render  option-anchored one-sentence render (needs a model):
 #     MODEL_PATH=/.../merged PRED=preds/.../m3.struct.jsonl \
 #       OUT=preds/mcqoe_render.jsonl MODE=render bash scripts/mcqoe_anchor.sh
-#
-# Then splice into M3 alongside the dossier (mcqoe override wins for mcq_openended,
-# since track3.structural._load_text_override keeps the LAST line per item_index):
-#     cat preds/experiment-1/dossier-040629-ext.jsonl preds/mcqoe_anchor.jsonl \
-#         > preds/experiment-1/dossier-040629-mcqoe.jsonl
-#     DOSSIER_TAG=mcqoe M_TAG=mcqoe bash scripts/experiment-1/m3_full.sh   # gate on board
+# Append the output after the dossier override (the last line per item_index wins).
 set -euo pipefail
 HERE="/home/jovyan/data/Challenges/AI-City/AI-City26-Track3"
 [ -d "$HERE" ] || HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

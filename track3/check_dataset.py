@@ -1,20 +1,7 @@
-"""Validate the processed ms-swift jsonl produced by ``build_dataset.py``.
+"""Validate the ms-swift jsonl produced by ``build_dataset.py`` before training.
 
-Run this after ``scripts/prepare_data.sh`` to confirm the data is well-formed
-*before* spending GPU hours. It checks, per record:
-
-  * message structure (system / user / assistant, non-empty assistant target),
-  * ``<video>`` tag count == number of video entries,
-  * media exists (the .mp4 file, or every frame in a frames list),
-  * per-task label format (Yes/No, A-D letter, valid MM:SS interval with start<=end),
-
-and across the split:
-
-  * per-task / per-split counts (and whether every task is represented),
-  * train/val **video-id leakage** (a video must not appear in both),
-  * a bounded sample of concrete error messages.
-
-Exit code is non-zero if any hard error is found, so it can gate CI / scripts.
+Checks message structure, <video> tag count, media existence, label format, task
+coverage and train/val video leakage. Exits non-zero on any hard error.
 
 Run: ``python -m track3.check_dataset --data-dir data``
      ``python -m track3.check_dataset --files data/train.jsonl --no-media``  # schema only
@@ -113,10 +100,7 @@ def _check_media(rec: dict) -> str | None:
 
 
 def _ts_seconds(value) -> float | None:
-    """Timestamp -> seconds, accepting EXACTLY what the official scorer accepts
-    (MM:SS, HH:MM:SS, fractional seconds, float). None if unparseable. Using the
-    grader's own parser keeps validation in lock-step with scoring (the labels carry
-    a mix of MM:SS / HH:MM:SS / .ff forms, all valid)."""
+    """Timestamp -> seconds via the grader's parser; None if unparseable."""
     from track3.tasks import parse_timestamp
     try:
         s = str(value or "").strip()
@@ -137,13 +121,10 @@ def _check_label(task_key: str, target: str) -> str | None:
         if extract_letter(target) is None:
             return f"mcq target has no extractable letter: {target!r}"
     elif metric == METRIC_IOU or spec.policy == POLICY_JSON_INTERVAL:
-        # The target may be inline-CoT ("reason ... {json}") — extract the embedded
-        # interval the way the official grader does (_extract_json), not a strict
-        # json.loads on the whole string (see build_dataset --temporal-cot).
+        # target may be inline CoT ("reason ... {json}"): extract the embedded interval
         obj = _extract_interval_obj(target)
         if obj is None:
             return f"no parseable start/end interval in target: {target!r}"
-        # check the *raw* order so a reversed interval in the labels is flagged.
         s, e = _ts_seconds(obj.get("start")), _ts_seconds(obj.get("end"))
         if s is None or e is None:
             return f"interval start/end not a valid timestamp: {target!r}"
@@ -216,7 +197,6 @@ def main() -> int:
 
     reports = [check_file(f, args) for f in files]
 
-    # --- per-file summary ----------------------------------------------------
     print(f"\n{'file':16s} {'records':>8s} {'missing':>8s} {'bad_lbl':>8s} {'errors':>8s}")
     hard_fail = False
     for rep in reports:
@@ -226,7 +206,6 @@ def main() -> int:
         if rep.n == 0 or rep.bad_label > 0 or miss_frac > args.max_missing_frac:
             hard_fail = True
 
-    # --- per-task coverage ---------------------------------------------------
     print(f"\n{'task':24s}" + "".join(f"{r.name:>14s}" for r in reports))
     for task in ALL_TASK_KEYS:
         row = "".join(f"{r.task_counts.get(task, 0):>14d}" for r in reports)
@@ -235,7 +214,6 @@ def main() -> int:
         if not any(r.task_counts.get(task, 0) for r in reports):
             hard_fail = True
 
-    # --- train/val leakage ---------------------------------------------------
     if len(reports) >= 2:
         leak = reports[0].video_ids & reports[1].video_ids
         if leak:
@@ -245,7 +223,6 @@ def main() -> int:
         else:
             print(f"\nNo video-id leakage between {reports[0].name} and {reports[1].name}.")
 
-    # --- example errors ------------------------------------------------------
     for rep in reports:
         if rep.errors:
             print(f"\nFirst errors in {rep.name}:")

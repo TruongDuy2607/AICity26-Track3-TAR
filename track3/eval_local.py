@@ -1,18 +1,7 @@
-"""Local leaderboard-faithful evaluation on a held-out split.
+"""Local evaluation on a held-out split, scored by the official ``track3/evaluate.py``.
 
-This does **not** reimplement the metrics — it formats predictions exactly as we
-would submit them and then calls the organizers' own ``track3/evaluate.py``. So the
-number it prints is the number the leaderboard would give on this split.
-
-Two ways to provide the ground truth and predictions:
-
-  1. ``--gt val_gt.json --pred preds/val_pred.jsonl``
-     val_gt.json is the tao-vl-reason-v1.0 file emitted by build_dataset.py
-     (real answers); val_pred.jsonl is the raw output of infer.py. We build a
-     submission CSV from the preds and score it.
-
-  2. ``--gt val_gt.json --submission my_sub.csv``
-     score an already-built submission CSV directly.
+  --gt val_gt.json --pred preds/val_pred.jsonl   build a submission from raw preds, then score
+  --gt val_gt.json --submission my_sub.csv       score an existing submission CSV
 
 Run: ``python -m track3.eval_local --gt data/val_gt.json --pred preds/val_pred.jsonl``
 """
@@ -42,7 +31,6 @@ def main() -> None:
 
     official = load_official()
 
-    # 1) obtain a submission CSV (build it from raw preds if needed).
     tmp = None
     if args.submission:
         sub_csv = args.submission
@@ -53,7 +41,6 @@ def main() -> None:
         print(f"[eval] built submission from {args.pred}: {n} rows")
         sub_csv = tmp.name
 
-    # 2) delegate scoring to the official evaluator (scores because GT has answers).
     result = official.evaluate(args.gt, sub_csv, allow_missing=args.allow_missing)
 
     print()
@@ -65,7 +52,6 @@ def main() -> None:
                 json.dump(metrics, f, indent=2, sort_keys=True)
             print(f"[eval] wrote {args.out}")
     else:
-        # GT answers were redacted -> validation-only (e.g. ran against test.json)
         print(f"[eval] validation-only ({result.get('reason')}). "
               "Pass a GT with real answers (data/val_gt.json) to get scores.")
 

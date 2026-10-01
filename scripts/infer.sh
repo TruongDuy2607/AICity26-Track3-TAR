@@ -5,10 +5,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$HERE/configs/common.sh"
 
-# Source: a LoRA adapter (ADAPTER) OR a full/merged model (MODEL_PATH).
-# Note: vLLM cannot apply LoRA to the Qwen3-VL vision tower; if your adapter has
-# ViT LoRA, either use BACKEND=transformers, or merge first
-# (`swift export --adapters <ckpt> --merge_lora true`) and pass MODEL_PATH.
+# Source: ADAPTER or MODEL_PATH. vLLM can't apply LoRA to the Qwen3-VL vision tower:
+# merge first (MODEL_PATH) or use BACKEND=transformers.
 MODEL_PATH="${MODEL_PATH:-}"
 if [ -n "$MODEL_PATH" ]; then
     SRC=(--model "$MODEL_PATH")
@@ -20,20 +18,15 @@ PRED_OUT="${PRED_OUT:-$HERE/preds/test_pred.jsonl}"
 BACKEND="${BACKEND:-vllm}"      # set BACKEND=transformers if vLLM isn't installed
 VOTE_N="${VOTE_N:-5}"
 ATTN_IMPL="${ATTN_IMPL:-sdpa}"  # only used by the transformers backend
-# W1 (method.md §9): closed-task decisions via first-token logprobs (calibrated
-# margins for structural.py, deterministic) + mcq_openended explanations
-# conditioned on the pooled letter. CLOSED_SCORING=vote restores legacy n-sample
-# voting; NO_CONDITIONED_OE=1 disables the conditioned second pass.
+# CLOSED_SCORING=vote restores legacy n-sample voting; NO_CONDITIONED_OE=1 disables
+# the conditioned mcq_openended pass.
 CLOSED_SCORING="${CLOSED_SCORING:-logprob}"
 CONDITIONED_ARG=()
 [ "${NO_CONDITIONED_OE:-0}" = "1" ] && CONDITIONED_ARG=(--no-conditioned-openended)
-# PROVE: MCQ_PERMUTE=4 scores mcq/mcq_openended under 4 cyclic option rotations and
-# averages the first-token distributions over option text (letter-bias debias).
+# MCQ_PERMUTE=4: average mcq scores over 4 cyclic option rotations (letter-bias debias).
 MCQ_PERMUTE="${MCQ_PERMUTE:-0}"
 
-# --- multi-GPU: vLLM tensor-parallel over all visible GPUs (TENSOR_PARALLEL),
-#     or transformers device_map sharding. Single-GPU when CUDA_VISIBLE_DEVICES has
-#     one id (TP=1, mem 0.9 == previous defaults, so single-GPU runs are unchanged).
+# multi-GPU: vLLM tensor parallel over all visible GPUs, or transformers device_map
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 NGPU=$(awk -F, '{print NF}' <<<"$CUDA_VISIBLE_DEVICES")
 TENSOR_PARALLEL="${TENSOR_PARALLEL:-$NGPU}"

@@ -1,12 +1,4 @@
-"""Task registry — the single source of truth for the 10 TAR sub-tasks.
-
-``build_dataset.py`` (training targets), ``infer.py`` / ``make_submission.py``
-(prediction formatting) and ``metrics.py`` / ``eval_local.py`` (scoring) all read
-from here, so adding or re-tuning a task is a one-line change in ``TASKS``.
-
-A task is identified by its ``key`` which equals the TAR annotation file stem,
-e.g. ``bcq`` ↔ ``bcq.json``.
-"""
+"""Task registry: the single source of truth for the 10 TAR sub-tasks."""
 from __future__ import annotations
 
 import json
@@ -14,21 +6,19 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-# --- metric families (must mirror the official evaluate.py) -------------------
+# Metric families (mirror the official evaluate.py).
 METRIC_ACC_YESNO = "acc_yesno"   # regex Yes/No accuracy
 METRIC_ACC_LETTER = "acc_letter"  # regex A-D accuracy
 METRIC_IOU = "iou"               # mean IoU over {start,end}
 METRIC_BERTSCORE = "bertscore"   # BERTScore-F1 roberta-large, rescaled
 
-# --- output policies (how the assistant target is shaped) ---------------------
+# Output policies (shape of the assistant target).
 POLICY_ANSWER_ONLY = "answer_only"      # bare token, e.g. "Yes" / "A"
 POLICY_ANSWER_TEXT = "answer_text"      # free-form graded text
 POLICY_JSON_INTERVAL = "json_interval"  # {"start":"MM:SS","end":"MM:SS"}
 
 VIDEO_TAG = "<video>"
 
-# System prompts priming the model per task family. Kept short and factual so the
-# model's answer register matches the concise, grounded TAR reference style.
 _SYS_BASE = (
     "You are an expert traffic-surveillance video analyst for an anomaly "
     "reasoning system. Watch the video carefully and answer grounded in the "
@@ -37,8 +27,6 @@ _SYS_BASE = (
 _SYS_CONCISE = _SYS_BASE + " Be concise, factual, and specific."
 _SYS_STRICT = _SYS_BASE + " Respond with exactly the requested format and nothing else."
 _SYS_ACC = _SYS_STRICT
-# Temporal localization is graded by IoU over wall-clock MM:SS, so the model must
-# anchor the event to the frame timestamps it is shown (see method.md §3.3).
 _SYS_TEMPORAL = (
     _SYS_BASE + " You are shown video frames sampled at known timestamps together "
     "with the total duration. Find when the queried event begins and ends by "
@@ -55,56 +43,30 @@ class TaskSpec:
     metric: str
     policy: str
     system: str
-    # Parse raw model output -> the gradable / submission string for this task.
     parse: Callable[[str], str]
-    # Format the *submission* string (e.g. fence temporal JSON). Defaults to parse.
     format_submission: Optional[Callable[[str], str]] = None
     items_per_video: int = 1         # bcq* carry 2 (a Yes and a No)
-    cot_policy: str = "none"         # none | hidden | inline  (see method.md §3.2)
-    # Time-sensitive tasks (temporal_localization) need an explicit, dense time
-    # axis: they always sample timestamped `extract` frames at a denser budget,
-    # independent of the global frames-mode (see frame_plan + method.md §3.3).
-    time_sensitive: bool = False
+    cot_policy: str = "none"         # none | hidden | inline
+    time_sensitive: bool = False     # see frame_plan
 
     def submission(self, raw: str) -> str:
-        """Map any raw model output to the EXACT string the official grader parses.
-
-        This is the single format-enforcement choke-point (see ``enforce_format``):
-        accuracy tasks collapse to their canonical token, temporal to a fenced JSON
-        interval, open-ended text is cleaned but kept verbatim. Idempotent, so it is
-        safe to apply at infer time *and* again in make_submission. An explicit
-        ``format_submission`` override (e.g. temporal's fence) takes precedence.
-        """
+        """Map raw model output to the exact string the official grader parses (idempotent)."""
         if self.format_submission is not None:
             return self.format_submission(raw)
         return enforce_format(self, raw)
 
 
-# ---------------------------------------------------------------------------
-# Extraction — mirrors track3/evaluate.py so our submission formatting and
-# self-consistency voting agree exactly with how the organizers grade.
-# (The authoritative copies live in the official scorer; these are kept
-#  byte-compatible and covered by a self-test in track3/check_eval.py.)
-# ---------------------------------------------------------------------------
+# Extractors mirror track3/evaluate.py (checked by track3/check_eval.py).
 _TIME = re.compile(r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2}(?:\.\d+)?)")
 
-# Reasoning ("thinking") that must be stripped before grading/submission. Qwen3.5
-# emits `<think>\n...\n</think>\n\n<answer>`; the think content (long CoT) would
-# wreck BERTScore and can flip the Yes/No / letter regex if left in.
+# <think>...</think> reasoning must be stripped before grading/voting.
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 _THINK_CLOSE = re.compile(r"</think>", re.IGNORECASE)
 _THINK_TAG = re.compile(r"</?think>", re.IGNORECASE)
 
 
 def strip_reasoning(text) -> str:
-    """Remove ``<think>...</think>`` reasoning, keeping only the final answer.
-
-    - Complete ``<think>...</think>`` blocks are dropped (text after them kept).
-    - If only a closing ``</think>`` survives (the opening was streamed as a
-      separate ``reasoning_content``), keep the tail after the last ``</think>``.
-    - A dangling, unclosed ``<think>`` (truncated output) leaves its text but the
-      lone tag is removed — so the temporal extractor can still mine timestamps.
-    """
+    """Drop complete, close-only or dangling ``<think>`` reasoning; keep the final answer."""
     if text is None:
         return ""
     s = str(text)
@@ -116,7 +78,6 @@ def strip_reasoning(text) -> str:
 
 
 def extract_yesno(text) -> Optional[str]:
-    """'yes' / 'no' / None — leading token preferred, else first occurrence."""
     if text is None or not str(text).strip():
         return None
     s = str(text).strip().lower()
@@ -128,7 +89,6 @@ def extract_yesno(text) -> Optional[str]:
 
 
 def extract_letter(text) -> Optional[str]:
-    """Single choice letter (upper) / None — mirrors official _extract_letter."""
     if text is None or not str(text).strip():
         return None
     s = str(text).strip()
@@ -142,7 +102,6 @@ def extract_letter(text) -> Optional[str]:
 
 
 def parse_timestamp(ts) -> float:
-    """MM:SS / HH:MM:SS / float-seconds -> seconds (mirrors official)."""
     parts = str(ts).strip().split(":")
     if len(parts) == 2:
         return int(parts[0]) * 60 + float(parts[1])
@@ -152,15 +111,7 @@ def parse_timestamp(ts) -> float:
 
 
 def _canon_ts(text) -> Optional[str]:
-    """First timestamp in ``text`` -> canonical zero-padded ``MM:SS[.ff]``.
-
-    Normalizes every form (MM:SS, HH:MM:SS, fractional) to the **MM:SS** shape the
-    prompt actually requests, so training targets and submissions are format-
-    consistent (e.g. ``00:00:13`` -> ``00:13``). Fractional seconds are preserved —
-    ~20% of temporal GT intervals are <3s where dropping ``.ff`` distorts the IoU.
-    The grader's ``_parse_timestamp`` reads seconds either way, so this never changes
-    a score; it only removes the HH:MM:SS/MM:SS inconsistency the auto-labels carry.
-    """
+    """First timestamp in ``text`` -> zero-padded ``MM:SS[.ff]`` (fractional seconds kept)."""
     m = _TIME.search(str(text))
     if not m:
         return None
@@ -173,14 +124,9 @@ def _canon_ts(text) -> Optional[str]:
 
 
 def parse_interval(text: str) -> str:
-    """Canonicalize any model/GT text to a {"start":"MM:SS","end":"MM:SS"} string.
+    """Canonicalize text to a {"start","end"} JSON string (always valid JSON).
 
-    Used for (a) canonicalizing training targets and (b) repairing submissions.
-    Always returns valid JSON so the temporal task is never unparseable. Models
-    routinely emit the ``{start,end}`` object *inline in prose* (unfenced), which
-    the official ``_extract_json`` misses (it only reads a ```json fence or a
-    whole-string JSON) — so we mine the embedded object first, then fall back to
-    the first two timestamps anywhere in the text.
+    Mines an inline {start,end} object first, then the first two timestamps.
     """
     text = strip_reasoning(text)
     start = end = None
@@ -206,13 +152,7 @@ def parse_interval(text: str) -> str:
 
 
 def parse_text(text: str) -> str:
-    """Submission form for raw-text answers: strip whitespace + any leaked tags.
-
-    The organizers extract the gradable token from raw model output themselves
-    (Yes/No, letter, BERTScore over the whole string), so for every task *except*
-    temporal_localization we submit the model's text essentially verbatim — but
-    with any ``<think>...</think>`` reasoning removed first (it is not the answer).
-    """
+    """Raw-text submission: strip whitespace, reasoning and leaked tags."""
     t = strip_reasoning(text)
     t = re.sub(r"</?(?:reason)>", "", t, flags=re.IGNORECASE).strip()
     return t
@@ -223,15 +163,8 @@ def fence_interval(text: str) -> str:
     return "```json\n" + parse_interval(text) + "\n```"
 
 
-# ---------------------------------------------------------------------------
-# Strict format enforcement — the deterministic guarantee that every prediction
-# we emit is EXACTLY what the official grader can parse, so compliance never
-# depends on the model's prose discipline. Each branch mirrors the matching
-# extractor in track3/evaluate.py.
-# ---------------------------------------------------------------------------
-# Non-empty placeholder for an open-ended answer the model failed to produce
-# (e.g. output truncated inside an unclosed <think>). BERTScore needs a real
-# token; this scores ~0 but never crashes or yields an empty/unparseable row.
+# Strict format enforcement: each branch mirrors an extractor in track3/evaluate.py.
+# Placeholder for an empty open-ended answer (BERTScore needs a non-empty string).
 _OPEN_FALLBACK = "unknown"
 
 
@@ -246,13 +179,10 @@ _MCQ_WORD = re.compile(r"\b([A-Da-d])\b")
 
 
 def enforce_letter(text: str) -> str:
-    """mcq -> exactly one of A/B/C/D, emitted bare so the grader can't misread it.
+    """mcq -> one bare A-D letter.
 
-    The official extractor is positional ("first letter-ish token"), so on a
-    rambling answer like "I think the answer is (C)" it returns 'I'. Since *we*
-    control the submitted string, we resolve the real option — prefer an explicit
-    option marker (C)/C., else the last standalone A-D, else default 'A' — and
-    emit just that letter, which the grader then reads unambiguously.
+    The official extractor is positional ("I think ... (C)" reads as 'I'), so resolve
+    an explicit marker, else the last standalone A-D, else 'A'.
     """
     s = strip_reasoning(text)
     v = extract_letter(s)
@@ -266,7 +196,7 @@ def enforce_letter(text: str) -> str:
 
 
 def enforce_text(text: str) -> str:
-    """Open-ended (BERTScore) -> cleaned text, guaranteed non-empty."""
+    """Open-ended -> cleaned, non-empty text."""
     t = parse_text(text)
     return t if t else _OPEN_FALLBACK
 
@@ -283,11 +213,7 @@ def enforce_format(spec: "TaskSpec", raw: str) -> str:
 
 
 def check_parseable(spec: "TaskSpec", submission_text: str) -> bool:
-    """True iff ``submission_text`` parses for ``spec``'s metric (grader's view).
-
-    Mirrors track3/evaluate.py's ``_check_parseable`` so the format-validation gate
-    in infer.py agrees byte-for-byte with how the organizers validate a CSV.
-    """
+    """True iff ``submission_text`` parses for ``spec``'s metric (mirrors official _check_parseable)."""
     if spec.metric == METRIC_ACC_YESNO:
         return extract_yesno(submission_text) is not None
     if spec.metric == METRIC_ACC_LETTER:
@@ -299,8 +225,7 @@ def check_parseable(spec: "TaskSpec", submission_text: str) -> bool:
 
 
 def extract_interval_obj(text: str):
-    """Parse a submission's temporal JSON the way the official _extract_json does
-    (fenced ```json block or whole-string JSON), returning the dict or None."""
+    """Parse temporal JSON like the official _extract_json; dict or None."""
     if text is None or not str(text).strip():
         return None
     s = str(text).strip()
@@ -320,11 +245,8 @@ def extract_interval_obj(text: str):
 
 
 def vote_token(spec: "TaskSpec", text: str) -> str:
-    """Reduce a sampled output to its canonical answer token (for voting).
-
-    Falls back to a deterministic guess when nothing parses, so a vote is always
-    cast (better expected score than abstaining on an unparseable sample)."""
-    text = strip_reasoning(text)  # never vote on tokens inside the <think> trace
+    """Canonical answer token for voting; deterministic guess when nothing parses."""
+    text = strip_reasoning(text)
     if spec.metric == METRIC_ACC_YESNO:
         v = extract_yesno(text)
         return v.capitalize() if v else "No"
@@ -334,9 +256,6 @@ def vote_token(spec: "TaskSpec", text: str) -> str:
     return parse_text(text)
 
 
-# ---------------------------------------------------------------------------
-# Registry
-# ---------------------------------------------------------------------------
 TASKS: dict[str, TaskSpec] = {
     "bcq": TaskSpec(
         "bcq", "basic", METRIC_ACC_YESNO, POLICY_ANSWER_ONLY,
@@ -380,7 +299,7 @@ def get_task(key: str) -> TaskSpec:
     return TASKS[key]
 
 
-# Heuristic fallback when a test item lacks an explicit `task` field.
+# Heuristic fallback when an item has no explicit task field.
 def infer_task_key(item: dict) -> str:
     for fld in ("task", "task_type", "type"):
         if item.get(fld) in TASKS:
@@ -409,20 +328,10 @@ def frame_plan(
     temporal_frames: Optional[int] = None,
     temporal_side: Optional[int] = None,
 ) -> tuple[str, int, int]:
-    """Per-task ``(frames_mode, num_frames, max_side)`` for video sampling.
+    """Per-task ``(frames_mode, num_frames, max_side)``, shared by build_dataset and infer.
 
-    Single source of truth shared by build_dataset and infer so train- and
-    test-time framing never diverge.
-
-    Time-sensitive tasks (temporal_localization) **always use native ``video``
-    mode**, never pre-extracted image lists. Measured finding (see memory
-    ``track3-status``): handing Qwen3-VL a list of JPEGs stamps them with a
-    *default* fps (~2) in ``ms-swift/.../qwen.py:replace_tag``, which corrupts the
-    model's native time-aligned position IDs and makes the timestamp hint a no-op
-    (mIoU stuck at 0.186). Native video preserves real fps/duration metadata; the
-    IoU lever is then driven by the *global frame budget* (FPS_MAX_FRAMES) plus a
-    duration hint in the prompt. We still surface a (denser) temporal frame count
-    so callers can raise FPS_MAX_FRAMES for time-sensitive items if desired.
+    Time-sensitive tasks always use native ``video`` mode: an image list gets a default
+    fps in ms-swift, which breaks Qwen3-VL's time-aligned position IDs.
     """
     if spec.time_sensitive:
         return "video", (temporal_frames or base_frames), (temporal_side or base_side)

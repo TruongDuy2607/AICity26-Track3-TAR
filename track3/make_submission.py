@@ -1,10 +1,6 @@
-"""Turn raw predictions into the official submission CSV.
+"""Turn raw predictions into the official submission CSV (``item_index,prediction``).
 
-Reads the predictions jsonl from :mod:`track3.infer` and emits ``item_index,prediction``
-with each prediction shaped to what the grader expects. Per the official
-``track3/evaluate.py`` the grader extracts the gradable token from raw model text
-itself, so we submit the text essentially verbatim — *except* temporal_localization,
-which we repair into a parseable fenced ```json block. 960 rows expected.
+Text is submitted near-verbatim; temporal_localization is repaired into a fenced ```json block.
 
 Run: ``python -m track3.make_submission --pred preds/test_pred.jsonl --out submissions/submission.csv``
 """
@@ -19,7 +15,7 @@ from track3.tasks import get_task, infer_task_key
 
 
 def write_submission(pred_path: str, out_path: str, test_json: str = "") -> int:
-    """Build the submission CSV. Returns the number of rows written."""
+    """Returns the number of rows written."""
     preds: dict[str, dict] = {}
     with open(pred_path, "r", encoding="utf-8") as f:
         for line in f:

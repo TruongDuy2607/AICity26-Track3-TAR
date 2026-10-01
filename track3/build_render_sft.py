@@ -1,43 +1,12 @@
-"""Evidence-Sheet -> Answer SFT distillation dataset builder (PROVE Phase 1;
-strategy C: GT facts + noise injection). Distils the reference-register answer
-distribution into the model through the exact evidence-grounded interface used at
-inference.
+"""Evidence-Sheet -> answer SFT dataset builder (GT facts + noise injection).
 
-ISOLATED, REMOVABLE add-on (like text_dossier / mcqoe_anchor): one module +
-track3/test_build_render_sft.py + scripts/prove/phase1_prepare.sh. It only READS the
-train GT (data/train/<task>.json) and WRITES an ms-swift SFT jsonl (same shape as
-data/processed/train.jsonl). Nothing in the current pipeline changes.
+Each example is (video + evidence sheet) -> GT narrative answer. The sheet comes from
+train GT; prediction-derived facts are corrupted at roughly the test error rate
+(cause/consequence -> distractor, scene swap, observation drop/flip) while the target
+stays the true GT, so the model learns to trust the video over a wrong fact.
+Question-derived facts (event, window, cast) are never corrupted.
 
-----------------------------------------------------------------------------
-STRATEGY (C) — GT facts + DAgger-style noise injection (PROVE.md §1 tier 1)
-----------------------------------------------------------------------------
-Each SFT example is  (video + evidence sheet) -> GT narrative answer.  The sheet is
-the CANONICAL Evidence Sheet v2 (track3/evidence.py — one schema shared verbatim
-with the test-time renderer), built from the TRAIN GT; every prediction-derived
-field is corrupted with a fixed probability so the training fact-noise MATCHES the
-test fact-noise:
-
-  * event_phrase, window, cast : parsed from the QUESTIONS -> exact at test -> NEVER
-                                 corrupted.
-  * cause / consequence        : our mcq-family PREDICTIONS at test (~0.85-0.93 acc)
-    (chosen option texts)        -> each replaced by a DISTRACTOR option with prob
-                                 ``p_consequence``.
-  * scene attributes           : W1 probes at test -> one attribute swapped within
-                                 its group with prob ``p_scene``.
-  * observations (bcq_oe)      : our bcq_oe PREDICTIONS at test -> each dropped with
-                                 prob ``p_obs_drop`` (optionally Yes/No-flipped).
-
-Crucially the TARGET is ALWAYS the true GT answer, even when a fact was corrupted:
-the model is taught to DOWN-WEIGHT an unreliable fact and fall back on the video
-(the prompt states the video is the ground truth). This is a static, dataset-level
-approximation of scheduled sampling / DAgger.
-
-At train time mix this with a replay of the original data/processed/train.jsonl
-(mix_replay keeps ALL base records) into ONE LoRA adapter so closed-task ability is
-preserved (unified system).
-
-Pure logic (evidence assembly / noise / prompt / record) has NO ms-swift / torch
-deps and is unit-tested on a CPU dev box.
+Optionally mixed with a full replay of the base SFT set into one training file.
 """
 from __future__ import annotations
 
@@ -61,7 +30,7 @@ from track3.evidence import (
 from track3.structural import normalize_ts, question_options, question_window, resolve_video
 from track3.temporal_grounding import parse_event_phrase
 
-# The 6 BERTScore narrative tasks whose reference register we distil.
+# BERTScore narrative tasks used as targets.
 NARRATIVE_TASKS = (
     "temporal_description",
     "causal_linkage",
@@ -70,14 +39,10 @@ NARRATIVE_TASKS = (
     "scene_description",
     "bcq_openended",
 )
-# Tasks read ONLY to build the evidence sheet (never emitted as targets on their own).
+# Tasks read to build the evidence sheet.
 _FACT_SOURCE_TASKS = ("temporal_localization", "mcq", "mcq_openended", "bcq",
                       "temporal_description", "causal_linkage", "scene_description")
 
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
 class NoiseConfig:
@@ -98,15 +63,11 @@ class BuildConfig:
     seed: int = 0
 
 
-# ---------------------------------------------------------------------------
-# Evidence sheet (GT-derived, with noise) — pure, unit-testable
-# ---------------------------------------------------------------------------
-
 _LEAD_YESNO = re.compile(r"^\s*(yes|no)\b", re.IGNORECASE)
 
 
 def flip_yesno(text: str) -> str:
-    """Flip a leading Yes<->No (keep the explanation) — for p_obs_flip corruption."""
+    """Flip a leading Yes<->No, keeping the explanation."""
     m = _LEAD_YESNO.match(text or "")
     if not m:
         return text
@@ -145,8 +106,7 @@ def _window(video_tasks: dict, item: dict) -> tuple[str, str] | None:
 
 
 def _cast(video_tasks: dict) -> tuple[str, ...]:
-    """Vehicle/agent descriptors over ALL of the video's question texts (sorted task
-    order so the sheet is deterministic regardless of dict insertion order)."""
+    """Vehicle/agent descriptors over all of the video's questions (deterministic order)."""
     qs = [it.get("question", "") for task in sorted(video_tasks)
           for it in video_tasks[task]]
     return extract_cast(qs)
@@ -154,7 +114,7 @@ def _cast(video_tasks: dict) -> tuple[str, ...]:
 
 def _scene(video_tasks: dict, rng: random.Random,
            noise: NoiseConfig) -> tuple[tuple[str, ...], bool]:
-    """Scene attributes mined from the SD ground truth, noise-corrupted w/ p_scene."""
+    """Scene attributes mined from the SD GT, corrupted with p_scene."""
     for it in video_tasks.get("scene_description", ()):
         mined = mine_scene_attributes(it.get("answer") or "")
         if mined:
@@ -164,10 +124,11 @@ def _scene(video_tasks: dict, rng: random.Random,
 
 def _mcq_facts(video_tasks: dict, rng: random.Random,
                noise: NoiseConfig) -> tuple[str, str, bool]:
-    """(cause, consequence, corrupted) from the GT-chosen options of BOTH mcq-family
-    items. Root-cause/fault stems feed 'cause', the rest 'consequence'; duplicate
-    option texts (the shuffled twins, data.md §5.3) dedupe to one line. With prob
-    ``p_consequence`` a chosen text is replaced by a distractor from its question."""
+    """(cause, consequence, corrupted) from the GT-chosen mcq/mcq_openended options.
+
+    Duplicate option texts dedupe; each chosen text becomes a distractor with prob
+    ``p_consequence``.
+    """
     cause = consequence = ""
     corrupted = False
     seen: set[str] = set()
@@ -199,7 +160,7 @@ def _observations(video_tasks: dict, rng: random.Random, noise: NoiseConfig,
     out = []
     for it in video_tasks.get("bcq_openended", ()):
         if skip_item is not None and it is skip_item:
-            continue  # don't feed a bcq_oe item its own answer as an 'observation'
+            continue  # never feed an item its own answer
         ans = (it.get("answer") or "").strip()
         if not ans:
             continue
@@ -250,10 +211,6 @@ def to_record(item: dict, task: str, facts: EvidenceSheet, vpath: str,
     }
 
 
-# ---------------------------------------------------------------------------
-# Orchestration
-# ---------------------------------------------------------------------------
-
 def load_train_by_video(train_dir: str, tasks) -> dict:
     """{video_id: {task: [items]}} over the target tasks + the fact-source tasks."""
     needed = set(tasks) | set(_FACT_SOURCE_TASKS)
@@ -261,7 +218,7 @@ def load_train_by_video(train_dir: str, tasks) -> dict:
     for task in sorted(needed):
         path = os.path.join(train_dir, f"{task}.json")
         if not os.path.exists(path):
-            print(f"[render_sft][WARN] no train file for '{task}' at {path} — skipped.")
+            print(f"[render_sft][WARN] no train file for '{task}' at {path}, skipped.")
             continue
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -287,7 +244,7 @@ def build(by_video: dict, videos_root: str, cfg: BuildConfig,
                 if not (it.get("answer") or "").strip():
                     continue
                 try:
-                    # Per-item deterministic RNG: reproducible + stable per item.
+                    # per-item deterministic RNG
                     irng = random.Random(f"{cfg.seed}:{vid}:{task}:{i}")
                     facts = build_evidence(vt, it, irng, cfg.noise, task=task)
                     per_task[task].append(to_record(it, task, facts, vpath, cfg))
@@ -297,7 +254,7 @@ def build(by_video: dict, videos_root: str, cfg: BuildConfig,
                         print(f"[render_sft][WARN] skip {vid}/{task}#{i}: {type(e).__name__}: {e}")
     if skipped_novideo:
         print(f"[render_sft][WARN] {skipped_novideo} video(s) missing under {videos_root}"
-              " — skipped.")
+              ", skipped.")
     if failed:
         print(f"[render_sft][WARN] {failed} item(s) skipped (malformed train rows).")
 
@@ -312,11 +269,10 @@ def build(by_video: dict, videos_root: str, cfg: BuildConfig,
 
 def mix_replay(render_records: list[dict], replay_path: str, ratio: float,
                out_path: str, seed: int) -> int:
-    """Combine the FULL base SFT set with the render set into ONE training file. To
-    prevent catastrophic forgetting, ALL base records are kept (replay must NEVER
-    shrink the base) and the render set is downsampled to at most base/ratio, i.e.
-    base:render >= ratio:1. Deterministic (seeded); drops the 'fact_corrupted' key.
-    Returns the total record count written."""
+    """Write all base records plus the render set capped at base/ratio (base:render >= ratio:1).
+
+    Returns the total record count.
+    """
     base = []
     with open(replay_path, encoding="utf-8") as f:
         for line in f:
@@ -326,7 +282,7 @@ def mix_replay(render_records: list[dict], replay_path: str, ratio: float,
     clean = [{k: v for k, v in r.items() if k != "fact_corrupted"} for r in render_records]
     rng.shuffle(clean)
     n_render = min(len(clean), int(round(len(base) / ratio))) if ratio and ratio > 0 else len(clean)
-    combined = base + clean[:n_render]          # ALL base preserved + render minority
+    combined = base + clean[:n_render]
     rng.shuffle(combined)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
@@ -355,10 +311,6 @@ def write_jsonl(records: list[dict], out_path: str) -> None:
               f"{corrupted[t]}/{n} = {corrupted[t]/max(n,1):.0%})")
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -380,7 +332,7 @@ def main() -> None:
     p.add_argument("--limit", type=int, default=0, help="first N videos (debug).")
     p.add_argument("--no-require-video", action="store_true",
                    help="emit records even if the video file is absent (dev/dry-run).")
-    # Replay-mix into a single training file (render:base = 1:replay-ratio).
+    # replay mix into a single training file
     p.add_argument("--replay-jsonl", default="",
                    help="base SFT jsonl (data/processed/train.jsonl) to interleave.")
     p.add_argument("--replay-ratio", type=float, default=2.0)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AI City Challenge 2026 Track 3 — TAR test set evaluator.
+AI City Challenge 2026 Track 3: TAR test set evaluator.
 
 Two modes:
 
@@ -36,8 +36,8 @@ Submission CSV format
 ---------------------
 Exactly two columns: ``item_index,prediction``.
 
-  - ``item_index`` — the 16-hex sample id from ``test.json``. Join key.
-  - ``prediction`` — the model's raw output text. Multi-line predictions
+  - ``item_index``: the 16-hex sample id from ``test.json``. Join key.
+  - ``prediction``: the model's raw output text. Multi-line predictions
     are fine; pandas CSV quoting handles them. See
     ``submission.example.csv`` for a concrete reference.
 
@@ -303,7 +303,7 @@ def validate(gt_df: pd.DataFrame, sub_df: pd.DataFrame, allow_missing: bool = Fa
         print(f"Submission validates with {total_bad} prediction(s) that may not parse cleanly;")
         print("they will receive 0/IoU=0 on the affected tasks but won't block scoring.")
     else:
-        print("Submission validates cleanly — all predictions parse for their task type.")
+        print("Submission validates cleanly: all predictions parse for their task type.")
 
     return {"total_items": len(gt_df), "rows": len(sub_df),
             "missing": len(missing), "extra": len(extra),

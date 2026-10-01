@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Hardware profile: 2 x A100 40GB (DDP, halve grad-accum to keep effective batch ~16).
+# Hardware profile: 4 x A100 80GB (8B).
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export NPROC_PER_NODE=4
 export PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"

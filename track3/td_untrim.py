@@ -1,28 +1,14 @@
-"""Restore the UNTRIMMED temporal_description MBR picks (FINAL_SPRINT.md L1b).
+"""Restore the untrimmed temporal_description MBR picks.
 
-The tdEcho/tdOne/tdEchoOne A/B falsified both register hypotheses and exposed a
-monotonic length trend on the board (TD: 156ch->0.3740, 326ch->0.4512; the opener
-alone is -0.06; SUM: 606ch->0.5040 vs 720ch->0.5270): the curated references are
-LONGER/richer than the trimmed renders — recall beats precision. The next
-one-variable read is therefore the untrimmed text of the SAME MBR-selected
-candidates that scored 0.4512.
+For each TD item take the longest pool candidate that extends the base row's text
+(both opener-stripped); otherwise keep the base row.
 
-Recovery is deterministic, no GPU: the shipped `mbr+register` step only dropped
-trailing sentences (and the base row is a prefix of its source candidate — verified
-80/80 on the union pool), so for each TD item we take the LONGEST pool candidate
-whose opener-stripped text prefix-matches the base row's opener-stripped text.
-"Between X and Y," openers are stripped everywhere (measured -0.06). No match or
-no longer text -> the base row is kept unchanged (partial-safe).
-
-Board-confirmed +0.031 TD (0.4512 -> 0.4823, tdLong 2026-07-10). Two modes:
-
-- pipeline (phase3_infer.sh stage 6b): rewrite the TD rows of the MBR text-override
-  jsonl in place of a submission CSV::
+- pipeline mode: rewrite the TD rows of the MBR text-override jsonl::
 
     python -m track3.td_untrim --override-jsonl preds/text_override.jsonl \
         --candidates preds/candidates.jsonl --out-jsonl preds/text_override.untrim.jsonl
 
-- submission A/B: derive a CSV variant from a scored base::
+- A/B mode: derive a CSV variant from a base submission::
 
     python -m track3.td_untrim --test-json data/test/test.json \
         --base-csv submissions/32b-top2/submission-subR.csv \
@@ -38,30 +24,22 @@ import re
 import statistics
 
 TASK = "temporal_description"
-# Anchor length for prefix matching: long enough to be unique per item, short
-# enough that every trimmed row still contains it.
-PREFIX_CHARS = 120
-# Minimum recovered gain worth taking (avoid swapping for whitespace variants).
-MIN_EXTRA_CHARS = 20
+PREFIX_CHARS = 120     # prefix-match anchor length
+MIN_EXTRA_CHARS = 20   # minimum gain to accept a longer candidate
 
 _OPENER = re.compile(
     r"^Between \d{1,2}:\d{2}(?::\d{1,2}|\.\d{1,2})? and "
     r"\d{1,2}:\d{2}(?::\d{1,2}|\.\d{1,2})?,\s*")
 
 
-# ---------------------------------------------------------------------------
-# Pure logic
-# ---------------------------------------------------------------------------
-
 def strip_opener(text: str) -> str:
-    """Drop a leading "Between X and Y, " window phrase (measured -0.06 on TD)."""
+    """Drop a leading "Between X and Y, " window phrase."""
     s = _OPENER.sub("", (text or "").strip())
     return s[:1].upper() + s[1:] if s else s
 
 
 def recover(base_text: str, candidates: list[str]) -> str:
-    """Longest opener-stripped candidate that the (opener-stripped) base text is a
-    prefix of; the base text itself when nothing longer matches."""
+    """Longest opener-stripped candidate extending the stripped base text, else the stripped base."""
     base = strip_opener(base_text)
     anchor = base[:PREFIX_CHARS]
     if not anchor:
@@ -80,8 +58,7 @@ def apply(base: dict[str, str], td_indices: list[str],
 
 
 def apply_jsonl(rows: list[dict], pool: dict[str, list[str]]) -> list[dict]:
-    """Untrim the TD rows of a text-override jsonl; every other row passes through
-    verbatim. Changed rows get a ``+untrim`` source suffix."""
+    """Untrim the TD rows of a text-override jsonl; changed rows get a ``+untrim`` source."""
     out = []
     for row in rows:
         row = dict(row)
@@ -93,10 +70,6 @@ def apply_jsonl(rows: list[dict], pool: dict[str, list[str]]) -> list[dict]:
         out.append(row)
     return out
 
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def _load_pool(path: str) -> dict[str, list[str]]:
     pool: dict[str, list[str]] = {}
@@ -126,7 +99,7 @@ def main() -> None:
 
     pool = _load_pool(a.candidates)
 
-    # --- pipeline mode: jsonl -> jsonl -------------------------------------------
+    # pipeline mode: jsonl -> jsonl
     if a.override_jsonl:
         assert a.out_jsonl, "--out-jsonl is required with --override-jsonl"
         with open(a.override_jsonl, encoding="utf-8") as f:
@@ -142,7 +115,7 @@ def main() -> None:
               + f" -> {a.out_jsonl}")
         return
 
-    # --- A/B mode: submission CSV -> CSV ------------------------------------------
+    # A/B mode: submission CSV -> CSV
     assert a.base_csv and a.out_csv, "need --base-csv + --out-csv (or --override-jsonl)"
     data = json.load(open(a.test_json, encoding="utf-8"))
     items = data["items"] if isinstance(data, dict) else data
@@ -155,7 +128,7 @@ def main() -> None:
 
     out = apply(base, td_idx, pool)
 
-    # Same hard gates as td_register: full index set, TD-only diff, no empties.
+    # hard gates: full index set, TD-only diff, no empties
     assert set(out) == set(base) == {it["item_index"] for it in items}, "index mismatch"
     changed = [k for k in base if out[k] != base[k]]
     assert all(k in set(td_idx) for k in changed), "a non-TD row changed"

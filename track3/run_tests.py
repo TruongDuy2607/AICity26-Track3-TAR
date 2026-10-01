@@ -1,7 +1,6 @@
-"""Minimal CPU test runner (the dev box has no pytest). Discovers track3/test_*.py,
-runs every top-level ``test_*`` function, reports pass/fail.
+"""Minimal CPU test runner: runs every ``test_*`` function in track3/test_*.py.
 
-Run:  python -m track3.run_tests [substring ...]   # optional module-name filters
+Run:  python -m track3.run_tests [substring ...]
 """
 from __future__ import annotations
 
